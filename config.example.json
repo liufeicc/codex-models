@@ -1,0 +1,74 @@
+{
+  // ===== codex-models（cxm）配置文件 =====
+  // 路径：~/.codex-models/config.json   （支持 // 与 /* */ 注释、允许尾逗号）
+  // 每个档位 = 一组「网关 + 令牌 + 模型」，进 Codex 会话后用 /model 选档即切换。
+
+  // 本地网关监听地址（所有 Codex 窗口共享同一个代理，一般无需改）
+  "host": "127.0.0.1",
+  "port": 4171,
+
+  // 默认档位：必须是下面 profiles 里的一个键；cxm 启动 Codex 时用它
+  "defaultProfile": "dashscope",
+
+  // 可选：明确指定 Codex 真身可执行文件（一般留空，cxm 会自动探测）
+  // "codexBin": "/home/me/.npm-global/lib/node_modules/@openai/codex/bin/codex.js",
+
+  // 可选：模型目录模板档（决定上下文窗口、工具集、系统提示词的元数据来源）
+  // 留空 = 自动挑选内置目录里可见的档位。可用 `cxm catalog --list` 查看候选。
+  // "catalogTemplate": "gpt-5.6-terra",
+
+  // 可选：追加给 codex 的参数（例如 ["--search"]）
+  // "extraArgs": [],
+
+  // 可选：false = 启动 Codex 时加 --no-daemon（不用共享后台服务，隔离性最强）
+  // "sharedDaemon": true,
+
+  // 可选：工具模式。classic（默认）= 顶层 tools + 普通函数调用，第三方模型/网关兼容性最好；
+  // inherit = 沿用 Codex 原生 Code Mode（把工具塞进 additional_tools 输入项，要求模型写 JS 编排）。
+  // "toolMode": "classic",
+
+  "profiles": {
+    // 档位键名会成为选择器里的代表名：cxm-profile-dashscope
+    "dashscope": {
+      // 显示名（选择器里的名字）：档位键 · 该档主模型
+      "name": "阿里云 DashScope",
+      "baseUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "apiKey": "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "model": "deepseek-v4.1-flash",
+      // 上游协议：responses（默认，Codex 原生协议）/ chat（OpenAI Chat Completions，由 cxm 转译）
+      "wireApi": "responses",
+      // 上下文窗口（写进模型目录，影响 Codex 的上下文/压缩判断；留空则沿用模板档）
+      "contextWindow": 200000,
+      // 可选：给该档单独追加请求头/查询参数
+      "httpHeaders": {},
+      "queryParams": {},
+      // 可选：非代表名的模型名映射（Codex 内部子任务或旧会话可能发来内置名）
+      // "modelMap": { "gpt-5.6-terra": "deepseek-v4.1-flash" },
+      // 可选：usage 口径归正（auto/on/off，见 README「usage 口径归正」）
+      "usageNormalize": "auto",
+      // 可选：上游「超长报错」文案适配（auto/off）
+      "errorAdapt": "auto",
+      // 可选：该档单独覆盖工具模式（classic/inherit）
+      // "toolMode": "classic"
+    },
+
+    "private": {
+      "name": "私有网关",
+      "baseUrl": "https://gateway.example.com/v1",
+      "apiKey": "sk-yyyyyyyyyyyyyyyyyyyyyyyyyyyy",
+      "model": "qwen3.8-max",
+      "wireApi": "responses",
+      "contextWindow": 131072
+    },
+
+    "deepseek": {
+      "name": "DeepSeek 官方",
+      "baseUrl": "https://api.deepseek.com/v1",
+      "apiKey": "sk-zzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+      "model": "deepseek-chat",
+      // DeepSeek 官方只提供 Chat Completions，交给 cxm 转译成 Codex 的 Responses 协议
+      "wireApi": "chat",
+      "contextWindow": 128000
+    }
+  }
+}
