@@ -7,6 +7,7 @@
  *   4300  chat 探针：只有 Chat Completions 的上游，返回 Chat SSE（含工具调用与 usage）；
  *   4400  口径异常探针：usage.input_tokens 故意小于 cached_tokens（Anthropic 口径）；
  *   4200  报错探针：返回「超长」400 JSON（验证文案适配）。
+ *   4500  思维链探针：记录 input 条目类型，验证 dropReasoning 档位是否剔除了 reasoning 条目。
  *
  * 记录写入 /tmp/cxm-e2e/logs/*.jsonl，供 e2e.sh 断言。
  */
@@ -134,6 +135,23 @@ http
     });
   })
   .listen(4400, "127.0.0.1", () => console.log("mock usage :4400"));
+
+/** 思维链探针：只记录 input 条目类型，用来验证 dropReasoning */
+http
+  .createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      let parsed = {};
+      try {
+        parsed = JSON.parse(body);
+      } catch {}
+      append("rsn", { model: parsed.model, inputTypes: (parsed.input || []).map((i) => i.type) });
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      sseText(res, "rsn-done", { input_tokens: 10, output_tokens: 1, total_tokens: 11, input_tokens_details: { cached_tokens: 0 } });
+    });
+  })
+  .listen(4500, "127.0.0.1", () => console.log("mock reasoning :4500"));
 
 /** 报错探针：超长报错文案 */
 http

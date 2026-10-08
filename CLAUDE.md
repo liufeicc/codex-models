@@ -137,6 +137,20 @@ catalog.ts  开窗时生成 ~/.codex-models/model-catalog.json（各档代表名
     `web_search` 丢弃并记日志；reasoning 默认丢弃（`EMIT_REASONING=false`，
     开启需先实测 Codex 对 reasoning 条目的校验）；非 SSE 响应（上游忽略 stream）
     也能一次性转成事件队。
+13. **跨上游思维链条目会被拒 → 档位级 `dropReasoning`**（2026-10-08 实测定论）：
+    reasoning 条目装的是**上游私有格式**。deepseek 档产出的长这样：
+    `encrypted_content` 只是个 UUID（`01cbf936-…-0`）+ 明文
+    `content:[{type:"reasoning_text"}]`；而 OpenAI 原生通道会**校验**这个加密块
+    是不是自己签发的。同一条目打四家上游验证：yongmu/gpt-6-astra **400
+    invalid_request_error**，gpt-5.6-sol / company-heren / company-ali 全 200。
+    触发场景：**会话中途换档** —— Codex 把整段历史（含别家产的条目）重发，整轮全废
+    （受影响会话卡在 10:41、10:42 两次 400；纯单档会话从不踩，因为理由条目自产自销）。
+    解法：给这类"会校验加密块"的档位写 `"dropReasoning": true`，网关在
+    `handleResponses` 里统一剔除 `input[]` 中 `type==="reasoning"` 的条目
+    （chat 档本来就丢，此开关对它们无额外作用），日志记 `丢弃思维链=N条`。
+    代价：连自家的思维链也丢掉，纯单档长会话连贯性略降 —— 所以**默认 false**，
+    不要全局打开。删除是安全的：reasoning 条目不被别的条目引用
+    （`function_call` 靠自己的 `id`/`call_id` 配对）。
 
 ## 协议事实（实测 Codex 0.159.3，改动前请复测）
 
@@ -208,9 +222,9 @@ CXM_HOME=/tmp/cxm-test node dist/cli.js <档位> exec --skip-git-repo-check "hi"
 ```
 
 **仓库里已带一套可复跑的回归测试**：`npm test` → `test/e2e.sh` + `test/mocks.mjs`
-（四个假上游：responses 探针 / chat 探针 / 口径异常探针 / 报错探针；17 项断言覆盖
-模型改写、令牌替换、工具模式、chat 转译工具闭环、换档三态、usage 归正、文案适配）。
-改网关代码后先跑它。
+（五个假上游：responses 探针 / chat 探针 / 口径异常探针 / 报错探针 / 思维链探针；
+21 项断言覆盖模型改写、令牌替换、工具模式、chat 转译工具闭环、换档三态、usage 归正、
+文案适配、`dropReasoning` 剔除与日志）。改网关代码后先跑它。
 
 假上游套路（本次联调用过，可复用）：
 
@@ -251,6 +265,11 @@ CXM_HOME=/tmp/cxm-test node dist/cli.js <档位> exec --skip-git-repo-check "hi"
 - **别照搬 claude-models 的 `usageNormalize:"on"`**：cm 走 Anthropic 口径（input 不含
   cache_read），Codex 走 OpenAI 口径（input 已含 cached）。上游若是 OpenAI 口径的网关，
   cm 那条 "on" 会把口径改反；cxm 用 `auto` 即可（只在 `input < cached` 自相矛盾时动手）。
+- **会话中途换档会让"严格校验思维链"的上游报 400**（如 yongmu/gpt-6-astra）：
+  症状是换档后每轮都 400 `invalid_request_error`，且**只有那个档位**报、别的档位正常。
+  已开的窗口改不了历史，要么给它写 `"dropReasoning": true`（会同时丢掉自家思维链），
+  要么开新线程继续。诊断口诀：拿会话里的 reasoning 条目分别打各家上游，谁 400 谁就是
+  "会校验加密块"的那个（详见"核心机制 13"）。
 - cm 配置里的 `CLAUDE_CODE_MAX_CONTEXT_TOKENS`（常见 100 万）是 Claude Code 的客户端上限，
   **不是**模型真实窗口，别原样搬到 cxm 的 `contextWindow`，否则 Codex 压缩不及时、报错。
 

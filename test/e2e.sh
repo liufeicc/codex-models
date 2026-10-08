@@ -7,7 +7,8 @@
 #   3) 换档：代表名换档 / cxm use 外部换档 / 回声不扳回档位
 #   4) usage 口径归正（Anthropic 口径自动补 cached）
 #   5) 超长报错文案适配
-#   6) 与用户 ~/.codex、~/.codex-models 完全隔离（只写 CXM_E2E_DIR），并显式钉住 Codex 真身
+#   6) dropReasoning：按档位剔除跨上游的 reasoning（思维链）条目
+#   7) 与用户 ~/.codex、~/.codex-models 完全隔离（只写 CXM_E2E_DIR），并显式钉住 Codex 真身
 #
 # 用法：npm run build && bash test/e2e.sh
 set -u
@@ -45,7 +46,9 @@ cfg = {
     "probe":   {"name": "responses档", "baseUrl": "http://127.0.0.1:4199/v1", "apiKey": "upstream-key-responses", "model": "probe-real-model", "wireApi": "responses", "contextWindow": 200000},
     "chatter": {"name": "chat档",      "baseUrl": "http://127.0.0.1:4300/v1", "apiKey": "upstream-key-chat",      "model": "chat-real-model",  "wireApi": "chat", "contextWindow": 131072},
     "anom":    {"name": "口径异常档",  "baseUrl": "http://127.0.0.1:4400/v1", "apiKey": "k", "model": "anom-real-model", "wireApi": "responses"},
-    "err":     {"name": "报错档",      "baseUrl": "http://127.0.0.1:4200/v1", "apiKey": "k", "model": "err-real-model",  "wireApi": "responses"}
+    "err":     {"name": "报错档",      "baseUrl": "http://127.0.0.1:4200/v1", "apiKey": "k", "model": "err-real-model",  "wireApi": "responses"},
+    "keep":    {"name": "留思维链档",  "baseUrl": "http://127.0.0.1:4500/v1", "apiKey": "k", "model": "keep-real-model", "wireApi": "responses"},
+    "drop":    {"name": "剔思维链档",  "baseUrl": "http://127.0.0.1:4500/v1", "apiKey": "k", "model": "drop-real-model", "wireApi": "responses", "dropReasoning": True}
   }
 }
 open(d + "/home/config.json", "w").write(json.dumps(cfg, ensure_ascii=False, indent=2))
@@ -59,7 +62,7 @@ trap cleanup EXIT
 
 cxm() { CXM_HOME="$CXM_HOME" node "$ROOT/dist/cli.js" "$@"; }
 logs() { cat "$CXM_E2E_DIR/logs/$1.jsonl" 2>/dev/null; }
-reset_logs() { for f in responses chat; do : > "$CXM_E2E_DIR/logs/$f.jsonl"; done; }
+reset_logs() { for f in responses chat rsn; do : > "$CXM_E2E_DIR/logs/$f.jsonl"; done; }
 
 cxm start >/dev/null || { echo "网关启动失败"; exit 1; }
 cxm catalog >/dev/null
@@ -112,6 +115,24 @@ TOKEN3=$(curl -sS -X POST -H "x-cxm-admin: $ADMIN" -H 'content-type: application
 ERR=$(curl -sS -X POST -H "authorization: Bearer $TOKEN3" -H 'content-type: application/json' \
   -d '{"model":"cxm-profile-err","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],"stream":true}' "http://127.0.0.1:$PORT/v1/responses")
 check "文案被改写并带上结构化字段" "$(echo "$ERR" | python3 -c "import sys,json; d=json.load(sys.stdin)['error']; print('yes' if d['message'].startswith('context window exceeded') and d['codex_error_info']=='context_window_exceeded' else 'no')")" "yes"
+
+echo
+echo "== 6) dropReasoning：剔除跨上游的思维链条目 =="
+# 带一条「别家产」的 reasoning 条目（encrypted_content 是 UUID + 明文 reasoning_text）
+rsn_req() { # $1=令牌 $2=代表名
+  curl -sS -o /dev/null -X POST -H "authorization: Bearer $1" -H 'content-type: application/json' \
+    -d "{\"model\":\"$2\",\"input\":[{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[],\"encrypted_content\":\"01cbf936-8e07-413d-a39c-44865f48c135-0\",\"content\":[{\"type\":\"reasoning_text\",\"text\":\"跨家思维链\"}]},{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hi\"}]}],\"stream\":true}" \
+    "http://127.0.0.1:$PORT/v1/responses"; }
+reg() { curl -sS -X POST -H "x-cxm-admin: $ADMIN" -H 'content-type: application/json' -d "{\"profile\":\"$1\"}" "http://127.0.0.1:$PORT/__cxm/register" | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])"; }
+rsn_types() { python3 -c "import sys,json; print(json.dumps(json.loads(open('$CXM_E2E_DIR/logs/rsn.jsonl').readline())['inputTypes'], ensure_ascii=False))"; }
+reset_logs
+TK_KEEP=$(reg keep); TK_DROP=$(reg drop)
+rsn_req "$TK_KEEP" cxm-profile-keep
+rsn_req "$TK_DROP" cxm-profile-drop
+check "默认档位原样透传 reasoning 条目" "$(rsn_types)" '["reasoning", "message"]'
+check "dropReasoning 档位剔除 reasoning 条目" "$(python3 -c "import sys,json; print(json.dumps(json.loads(open('$CXM_E2E_DIR/logs/rsn.jsonl').readlines()[1])['inputTypes'], ensure_ascii=False))")" '["message"]'
+check "上游收到的模型已改写" "$(python3 -c "import sys,json; print(json.loads(open('$CXM_E2E_DIR/logs/rsn.jsonl').readlines()[1])['model'])")" "drop-real-model"
+check_at_least "网关日志记录了丢弃条数" "$(grep -c '丢弃思维链=1条' "$CXM_HOME/run/proxy.log" || true)" 1
 
 echo
 echo "===== 结果：通过 $PASS 项，失败 $FAIL 项 ====="

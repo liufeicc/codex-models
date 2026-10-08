@@ -49,7 +49,13 @@
       // 可选：上游「超长报错」文案适配（auto/off）
       "errorAdapt": "auto",
       // 可选：该档单独覆盖工具模式（classic/inherit）
-      // "toolMode": "classic"
+      // "toolMode": "classic",
+      // 可选：转发前剔除 reasoning（思维链）条目（默认 false）。
+      // 只在「该档上游会校验 encrypted_content」时才开：这类上游（OpenAI 原生通道）
+      // 拿到别家产的思维链条目会直接 400。会话中途从别的档切过来就会踩，开了可根治；
+      // 代价是连自家的思维链也一并丢掉，纯单档长会话的连贯性略降。
+      // 注意 chat 协议的档位本来就丢弃 reasoning，此开关对它们没有额外作用。
+      // "dropReasoning": true
     },
 
     "private": {

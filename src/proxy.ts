@@ -65,6 +65,8 @@ interface ReqCtx {
   switched: boolean;
   modelFrom: string;
   modelTo: string;
+  /** 本次请求被剔除的 reasoning（思维链）条目数（档位开了 dropReasoning 时才有值） */
+  droppedReasoning: number;
 }
 
 const BODY_LIMIT = 64 * 1024 * 1024; // 与 cm 一致：要完整缓冲才能改写 body.model
@@ -477,7 +479,11 @@ async function handleResponses(req: IncomingMessage, res: ServerResponse, gw: Ga
     ? profile.model
     : (profile.modelMap[modelFrom] ?? profile.model);
 
-  const ctx: ReqCtx = { session, profile, switched, modelFrom, modelTo };
+  // 档位要求剔除思维链条目时在这里统一处理：chat 转译本来就丢弃 reasoning，
+  // 但 responses 直通会把它们原样发给上游（正是 400 的来源）。
+  const droppedReasoning = profile.dropReasoning ? stripReasoningItems(body) : 0;
+
+  const ctx: ReqCtx = { session, profile, switched, modelFrom, modelTo, droppedReasoning };
   const started = Date.now();
   try {
     if (profile.wireApi === "chat") await forwardChat(req, res, gw, ctx, body, started);
@@ -493,6 +499,30 @@ async function handleResponses(req: IncomingMessage, res: ServerResponse, gw: Ga
   }
 }
 
+/**
+ * 剔除 input[] 里的 reasoning（思维链）条目，返回剔除条数。
+ *
+ * 为什么需要（2026-10-08 实测）：reasoning 条目携带的是**上游私有格式**的内容，
+ * 跨上游复用会被拒。deepseek 档产出的条目长这样：
+ *   encrypted_content = "01cbf936-8e07-413d-a39c-44865f48c135-0"（只是个 UUID）
+ *   content = [{type:"reasoning_text", ...}]（明文思维链）
+ * 而 OpenAI 原生通道（如 yongmu 的 gpt-6-astra）会**校验** encrypted_content 是不是
+ * 自己签发的加密块，校验失败直接 400 invalid_request_error。
+ * 会话中途换档时 Codex 会把整段历史重发（含别家产的条目），于是整轮请求全废 ——
+ * 用同一条条目打四家上游验证过：只有校验加密块的那家 400，其余三家 200。
+ *
+ * 只动顶层 input[]，其余字段原样保留；reasoning 条目不被任何别的条目引用
+ * （function_call 靠自己的 id/call_id 配对），所以整条删掉是安全的。
+ */
+function stripReasoningItems(body: Record<string, unknown>): number {
+  const input = body.input;
+  if (!Array.isArray(input)) return 0;
+  const kept = input.filter((item) => (item as Record<string, unknown> | null)?.type !== "reasoning");
+  const dropped = input.length - kept.length;
+  if (dropped > 0) body.input = kept;
+  return dropped;
+}
+
 /** 组装日志尾巴（含 usage；不含任何凭据） */
 function tailOf(ctx: ReqCtx, status: number, started: number, extra: string[] = []): string {
   const s = ctx.session;
@@ -501,6 +531,7 @@ function tailOf(ctx: ReqCtx, status: number, started: number, extra: string[] = 
     `档位=${ctx.profile.key}`,
     `模型=${ctx.modelFrom}→${ctx.modelTo}`,
     ctx.switched ? "换档=是" : null,
+    ctx.droppedReasoning > 0 ? `丢弃思维链=${ctx.droppedReasoning}条` : null,
     `协议=${ctx.profile.wireApi}`,
     `状态=${status}`,
     `上游=${hostOf(ctx.profile.baseUrl)}`,

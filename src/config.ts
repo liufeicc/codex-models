@@ -45,6 +45,16 @@ export interface ProfileConfig {
   errorAdapt?: "auto" | "off";
   /** 工具模式：classic（默认，顶层 tools + 普通函数调用，第三方最兼容）/ inherit（沿用 Codex 原生 Code Mode） */
   toolMode?: "classic" | "inherit";
+  /**
+   * 转发前剔除 input[] 里的 reasoning（思维链）条目，默认 false。
+   *
+   * 为什么需要：reasoning 条目是**上游私有格式**，跨上游复用通常会被拒。
+   * 实测（2026-10-08）deepseek 档产出的条目 `encrypted_content` 只是个 UUID，
+   * OpenAI 原生通道（yongmu 的 gpt-6-astra）会校验那个加密块，校验失败直接
+   * 400 invalid_request_error —— 于是会话中途换档后整轮请求全废。
+   * 给「校验加密块的上游」打开它即可根治（代价：丢掉自己的思维链，连贯性略降）。
+   */
+  dropReasoning?: boolean;
 }
 
 /** 配置文件的原始结构 */
@@ -84,6 +94,8 @@ export interface ResolvedProfile {
   usageNormalize: "auto" | "on" | "off";
   errorAdapt: "auto" | "off";
   toolMode: "classic" | "inherit";
+  /** 转发前剔除 reasoning（思维链）条目：给会校验 encrypted_content 的上游用，见 ProfileConfig 注释 */
+  dropReasoning: boolean;
 }
 
 /** 运行期配置 */
@@ -290,6 +302,8 @@ export function loadConfig(): ResolvedConfig {
       usageNormalize: p.usageNormalize ?? "auto",
       errorAdapt: p.errorAdapt ?? "auto",
       toolMode: p.toolMode ?? raw.toolMode ?? "classic",
+      // 只有显式 true 才开启：误开会让所有档位都失去思维链连贯性
+      dropReasoning: p.dropReasoning === true,
     };
   }
 
