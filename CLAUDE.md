@@ -22,7 +22,7 @@ cxm uninstall      # 卸载壳，还原原生 codex 命令
 ## 架构与模块分工
 
 ```
-敲 codex（壳 PATH/bin/codex → exec cxm launch）
+敲 codex（壳所在目录 ~/.codex-models/bin 排在 PATH 最前 → exec cxm launch）
   └→ launch.ts  注册会话领令牌 → 组装 -c 注入 + env → spawn 真身 codex
         ↕  /__cxm/register、/__cxm/attach(pid)、/__cxm/detach
 proxy.ts  本地网关 127.0.0.1:4171（所有窗口共享一个）
@@ -41,7 +41,8 @@ catalog.ts  开窗时生成 ~/.codex-models/model-catalog.json（各档代表名
 | `src/translate.ts` | Responses ⇄ Chat Completions 双向转译（含 SSE 事件序列） |
 | `src/adapt.ts` | usage 口径归正（UsageNormalizer）+ 超长报错文案适配（adaptErrorBody） |
 | `src/daemon.ts` | 网关守护进程：探活、分离启动、SIGTERM 停止、管理令牌、pid 文件 |
-| `src/codexBin.ts` | 定位 Codex 真身、装/卸 codex 壳（防递归 + 先 unlink） |
+| `src/codexBin.ts` | 定位 Codex 真身、装/卸 codex 壳（防递归 + 先 unlink + 清理历史遗留旧壳） |
+| `src/shellPath.ts` | 把壳所在目录写进 shell 启动脚本的 PATH（幂等注入 + 精确移除） |
 | `src/launch.ts` | 启动 Codex：注册/attach/detach、参数与 env 注入 |
 | `src/proxy-main.ts` | 守护进程入口（启用自退；`cxm proxy` 前台调试不自退） |
 
@@ -80,16 +81,29 @@ catalog.ts  开窗时生成 ~/.codex-models/model-catalog.json（各档代表名
    （我们的参数在前，用户自己的参数在后，可覆盖我们）。真实令牌只存在
    `~/.codex-models/config.json`（0600）与网关内存里，**绝不进 argv**（`ps` 不可见）；
    argv 里的令牌只是"身份牌"。
-7. **壳防递归 + 先 unlink 再写**：`resolveRealCodex` 找真身的顺序是
+7. **壳装在自己的目录（不再被 npm 升级冲掉）**：壳写在 `~/.codex-models/bin/codex`，
+   再由 `shellPath.ts` 往 shell 启动脚本（bash 的 `~/.bashrc`、zsh 的 `~/.zshrc`）
+   追加两行带标记的 PATH 注入（`# CXM_PATH_v1` + `export PATH="<壳目录>:$PATH"`），
+   保证系统找 `codex` 时先命中壳。
+   为什么必须搬出 npm 全局 bin 目录（2026-10-08 实测，npm 10.9.2）：`npm i -g
+   @openai/codex` 升级时，arborist 的 reify 会把这个包的 `node.binPaths`
+   （= `<prefix>/bin/codex`）放进 trash 列表，先 `rename` 挪走再删除，最后重建自己的
+   符号链接；放在那里的壳文件会被整份删掉，于是每次升级 Codex 都得重跑 `cxm install`。
+   搬家之后 npm 碰不到壳；壳里记的又是跨版本稳定的 `.../@openai/codex/bin/codex.js`，
+   所以升级后直接可用（已用"造一个假全局包 + 升级"的隔离实验复现过被删与不再被删两种情形）。
+   `resolveRealCodex` 找真身的顺序是
    `配置 codexBin` → `state.json 记录` → `PATH 里不是壳的候选` → **`壳脚本里
    CXM_REAL_CODEX 记的真身`** → **`按 npm 全局布局从壳所在目录反推`**。后两级是
    兜底：装过壳的机器上 PATH 里的 `codex` 就是壳本身，没有它们就会"找不到真身"
    （换 `CXM_HOME`、删 `state.json`、老格式壳都会踩）。识别壳靠首行 `CXM_SHIM_v1` 标记。
-   同理，`cxm install` 是**幂等**的：已经装过壳时不会报错，而是刷新真身记录并把老格式
-   壳升级成新格式（壳位置依次按"真身自己在 PATH 里 → 我们自己的壳 → `state.json`
-   记录 → PATH 首个非壳候选"挑选）。
-   写壳前必须 `unlink`：npm 全局的 `codex` 是符号链接，直接 writeFile 会穿透链接覆盖
-    287MB 真身二进制（cm 踩过）。卸载时按 `state.json` 还原符号链接/备份文件。
+   `cxm install` 是**幂等**的：内容一致就不重写壳，PATH 已就位就跳过写启动脚本；
+   PATH 里已有注入块但顺序仍不对时，把块挪到脚本末尾（最后执行 = 排最前）。
+   碰到老版本留在 npm 全局 bin 目录里的旧壳时，按 `state.json` 记录还原成安装前的
+   符号链接/备份文件；只有新壳暂时生效不了（写脚本失败、`--no-rc`、隔离 `CXM_HOME`）
+   才把它留着兜底，并在 `state.json` 的 `shim.legacy` 里记住，下次再清理。
+   写文件前必须 `unlink`：npm 全局的 `codex` 是符号链接，直接 writeFile 会穿透链接覆盖
+   287MB 真身二进制（cm 踩过）。
+   隔离实例（`CXM_HOME` 指向别处）不碰用户的启动脚本，只打印手工步骤。
 8. **网关生命周期**：首窗自动拉起；会话引用计数（register/attach/detach）+
    GC 每 15s 探测 pid 存活（`process.kill(pid,0)`）+ 零会话 10s 宽限自退；
    无 pid 的临时会话 5 分钟空闲回收。管理接口（`/__cxm/*`）用 `run/admin-token`（0600）
@@ -168,6 +182,8 @@ catalog.ts  开窗时生成 ~/.codex-models/model-catalog.json（各档代表名
 - 内置目录缓存：`~/.codex-models/builtin-catalog.json`（`cxm catalog --refresh` 重抓）
 - 运行时目录：`~/.codex-models/run/`（proxy.log、proxy.pid、admin-token）
 - 状态文件：`~/.codex-models/state.json`（真身路径 + 装壳前原始信息）
+- 壳目录：`~/.codex-models/bin/codex`（cxm 自己的可执行目录，npm 升级碰不到）
+- PATH 注入：shell 启动脚本末尾两行（`# CXM_PATH_v1` 标记 + export PATH，`cxm uninstall` 精确移除）
 - `CXM_HOME` 环境变量可整体改主目录（隔离测试用）
 
 ## 开发约定
@@ -211,10 +227,14 @@ CXM_HOME=/tmp/cxm-test node dist/cli.js <档位> exec --skip-git-repo-check "hi"
 让假真身对 `debug models` 返回真实目录 JSON、其它情况打印 argv/env，
 然后 `PATH=/tmp/bin:$PATH CXM_HOME=/tmp/home node dist/cli.js install`，
 验证"壳能转发、env 注入正确、真身二进制未被写坏、uninstall 还原符号链接"。
+注意 `CXM_HOME` 非默认时 cxm 只打印手工 PATH 步骤、不改启动脚本；要连启动脚本一起验，
+就把 `HOME` 指向临时目录（`os.homedir()` 认 `$HOME`）再跑 `cxm install`。
 
 ## 已知约束 / 坑
 
-- 壳被 Codex 升级冲掉（npm 重建 `codex` 链接）→ 重跑 `cxm install`。
+- 升级 Codex 不再需要重跑 `cxm install`（壳在自己的目录里）；老版本装的壳仍在
+  npm 全局 bin 目录时，跑一次 `cxm install` 会自动搬走。若 `cxm doctor` 提示"壳不在
+  PATH 最前"，说明那行 PATH 注入没生效（比如用了 fish、或启动脚本里又有更晚的 PATH 改动）。
 - `cxm install` 可重复执行（幂等）；`cxm uninstall` 会按 `state.json` 还原原生命令。
 - `cxm -h` / `cxm --help` 打印 cxm 自己的帮助；只有走 `launch` 子命令的 codex 壳
   才把 `--help` 原样透传给 Codex 真身（保持 `codex --help` 的行为一致）。

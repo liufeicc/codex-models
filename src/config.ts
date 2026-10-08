@@ -108,6 +108,16 @@ export function homeDir(): string {
   return process.env.CXM_HOME || path.join(os.homedir(), ".codex-models");
 }
 
+/**
+ * 是否在用默认主目录（没设 CXM_HOME）。
+ * 隔离实例（CXM_HOME 指向别处）不配自动改用户的 shell 启动脚本：
+ * 多个实例抢同一份 PATH 注入只会互相覆盖，让 PATH 与 state.json 对不上。
+ */
+export function isDefaultHome(): boolean {
+  if (!process.env.CXM_HOME) return true;
+  return path.resolve(process.env.CXM_HOME) === path.join(os.homedir(), ".codex-models");
+}
+
 export function configPath(): string {
   return path.join(homeDir(), "config.json");
 }
@@ -120,6 +130,15 @@ export function runDir(): string {
 /** 状态文件（记录 Codex 真身路径、安装的壳信息） */
 export function statePath(): string {
   return path.join(homeDir(), "state.json");
+}
+
+/**
+ * cxm 自己的可执行目录：codex 壳放在这里，而不是 npm 的全局 bin 目录。
+ * 原因：npm 升级 @openai/codex 时会把它认为属于自己的 <prefix>/bin/codex
+ * 先移走再删除（arborist 的 trash 列表包含 node.binPaths），放在那里的壳会被删掉。
+ */
+export function cxmBinDir(): string {
+  return path.join(homeDir(), "bin");
 }
 
 /** 模型目录文件（注入给 Codex 的 model_catalog_json） */

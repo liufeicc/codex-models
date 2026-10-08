@@ -30,8 +30,11 @@ cxm setup                    # install the codex shim + generate a config templa
 **keep typing `codex`** as usual — cxm starts the gateway and injects the profile for you.
 To revert: `cxm uninstall`.
 
-> Note: `npm i -g @openai/codex` (upgrading Codex) recreates the `codex` symlink and wipes the
-> shim. Just re-run `cxm install` afterwards.
+The shim lives in `~/.codex-models/bin` (cxm's own directory, *not* npm's global bin), and
+`cxm install` adds one marked line to your shell startup file (`~/.bashrc` / `~/.zshrc`) so that
+this directory comes first on `PATH`. Upgrading Codex with `npm i -g @openai/codex` no longer
+wipes the shim, so no re-install is needed afterwards. `cxm uninstall` removes both the shim
+and that line.
 
 ## 30-second tour
 
@@ -67,7 +70,7 @@ cxm use deepseek --last          # same as above (most recently active)
 ## How it works
 
 ```
-codex (shim → cxm launch)
+codex (shim directory ~/.codex-models/bin first on PATH → cxm launch)
   ▼
 cxm launcher
   │ ensure the shared gateway is up (start it if not)
@@ -221,7 +224,7 @@ cxm -h | --help          # cxm's own help (not passed through to Codex)
 - **Profiles missing from the picker**: make sure this session was started via `codex` (the shim) or `cxm`;
 - **A newly added profile doesn't show in an open window**: the model catalog is **frozen at window start**; reopen the window (the gateway side takes effect immediately);
 - **`cxm use` switched the profile but the UI's model label didn't change**: expected — the label is Codex's own view; the actual requests already go to the new profile. To make both agree, switch via `/model`;
-- **Shim stops working after upgrading Codex**: re-run `cxm install` (idempotent: refresh the binary path, no duplicate install);
+- **Upgrading Codex no longer breaks the shim**: the shim lives in `~/.codex-models/bin` with that directory first on `PATH`, so npm's upgrade of `@openai/codex` can't touch it. If you migrated from an older cxm, one `cxm install` moves the old shim out of npm's bin directory. `cxm doctor` warns when the shim is installed but not first on `PATH` (e.g. after switching to a shell cxm can't edit, like fish);
 - **After editing config / restarting the gateway, what about open windows?**: the catalog is frozen at window start, so new profiles won't show in `/model`; reopening is easiest. Old windows keep working (their next request falls back to `defaultProfile`, logged as a temporary session). A gateway started by hand with `cxm start` stays resident (won't auto-exit with no windows), so windows open during a restart aren't refused;
 - **"Cannot find the real Codex binary"**: the shim records the real path in its `# CXM_REAL_CODEX:` line, so cxm can recover it even if `state.json` is lost or `CXM_HOME` changed; if all else fails, set `"codexBin": "/path/@openai/codex/bin/codex.js"` in the config;
 - **A profile reports "warming up" / won't connect**: `cxm status` to check the gateway, `cxm doctor` to check item by item.
@@ -250,6 +253,7 @@ src/
 ├── adapt.ts      # usage normalization + context-error message adaptation
 ├── daemon.ts     # gateway daemon management (probe/start detached/stop)
 ├── codexBin.ts   # locate the real Codex binary + install/remove the codex shim
+├── shellPath.ts  # inject/remove the shim directory in the shell startup file's PATH
 ├── launch.ts     # launch Codex: register session, inject profile, pass args
 └── proxy-main.ts # daemon entry point
 ```

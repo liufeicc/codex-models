@@ -28,8 +28,10 @@ cxm setup                    # 装 codex 壳 + 生成配置模板
 `cxm setup` 会把 `codex` 命令接上 cxm（装一个透明壳）：此后**照旧敲 `codex`**
 即自动拉网关、注入档位，不用记任何新命令。还原：`cxm uninstall`。
 
-> 注意：`npm i -g @openai/codex` 升级 Codex 会重建 `codex` 链接、冲掉壳，
-> 届时重跑一次 `cxm install` 即可。
+壳装在 `~/.codex-models/bin`（cxm 自己的目录，不是 npm 的全局 bin），`cxm install` 会往
+shell 启动脚本（`~/.bashrc` / `~/.zshrc`）末尾加一行带标记的 PATH 注入，让这个目录排在
+最前面。此后 `npm i -g @openai/codex` 升级 Codex 不会再冲掉壳，不需要重新安装；
+`cxm uninstall` 会同时删掉壳和那一行。
 
 ## 30 秒上手
 
@@ -64,7 +66,7 @@ cxm use deepseek --last          # 同上（最近活跃）
 ## 原理
 
 ```
-敲 codex（壳 → cxm launch）
+敲 codex（壳目录 ~/.codex-models/bin 排在 PATH 最前 → cxm launch）
   ▼
 cxm 启动器
   │ 确保共享网关在跑（不在就拉起）
@@ -193,7 +195,7 @@ cxm start|stop|status   # 管理本地网关（一般自动；手工 start 为�
 cxm catalog             # 重新生成模型目录；--list 看模板候选；--refresh 重抓内置目录
 cxm doctor              # 自检（配置/真身/壳/目录/网关/会话）
 cxm setup               # 一步就位：装壳 + 生成配置模板
-cxm install|uninstall   # 只装/只卸 codex 壳
+cxm install|uninstall   # 只装/只卸 codex 壳（install 可加 --no-rc 跳过写 shell 启动脚本）
 cxm init                # 只生成配置模板
 cxm proxy               # 前台运行网关（调试，不自动退出）
 cxm -h | --help         # 看 cxm 自己的帮助（不会透传给 Codex）
@@ -215,7 +217,10 @@ cxm -h | --help         # 看 cxm 自己的帮助（不会透传给 Codex）
 - **新加的档位在已开窗口里不显示**：模型目录在**开窗时固化**，重开窗口即可（网关侧立即生效）；
 - **`cxm use` 换了档，但 Codex 界面上的模型标签没变**：正常现象——界面标签是 Codex 自己的
   认知，实际请求已按新档位发出；想两边一致就直接用 `/model` 选档；
-- **升级 Codex 后壳失效**：重跑 `cxm install`（幂等：已装过只刷新真身记录，不会重复安装）；
+- **升级 Codex 后壳不再失效**：壳在 `~/.codex-models/bin` 且该目录排在 PATH 最前，
+  npm 升级 `@openai/codex` 碰不到它；从老版本 cxm 升上来的话，跑一次 `cxm install`
+  会把旧壳从 npm 全局 bin 目录搬走。`cxm doctor` 在"壳已装但不在 PATH 最前"时会告警
+  （例如换了 cxm 改不了的 shell，如 fish）；
 - **改完配置/重启网关后，已开窗口怎么办**：模型目录在开窗时固化，`/model` 里看不到新档位，
   重开窗口最省事；旧窗口也能继续跑（下次请求会落回 `defaultProfile`，日志记 `临时会话`）。
   手工 `cxm start` 启动的网关是常驻的（不会因"没窗口"自退），重启期间开着的窗口不会连接被拒；
@@ -252,6 +257,7 @@ src/
 ├── adapt.ts      # usage 口径归正 + 超长报错文案适配
 ├── daemon.ts     # 网关守护进程管理（探活/分离启动/停止）
 ├── codexBin.ts   # 定位 Codex 真身 + 装/卸 codex 壳
+├── shellPath.ts  # 把壳目录注入/移出 shell 启动脚本的 PATH
 ├── launch.ts     # 启动 Codex：注册会话、注入档位、透传参数
 └── proxy-main.ts # 守护进程入口
 ```

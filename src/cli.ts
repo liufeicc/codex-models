@@ -54,7 +54,7 @@ const HELP = `cxm — Codex 多供应商即时切换工具
   cxm start|stop|status  管理本地网关（一般自动启停，无需手工）
   cxm catalog            重新生成模型目录；--list 看模板候选；--refresh 重抓内置目录
   cxm init               生成配置模板（不覆盖已有配置）
-  cxm install            安装 codex 壳：敲 "codex" 即自动经 cxm 启动
+  cxm install [--no-rc]  安装 codex 壳（--no-rc = 不写 shell 启动脚本，PATH 自己管）
   cxm uninstall          卸载壳，还原原生 codex 命令
   cxm setup              新机器一步就位：装壳 + 生成配置模板
   cxm doctor             自检（配置 / 真身 / 网关 / 模型目录 / 会话）
@@ -210,7 +210,17 @@ async function cmdDoctor(cfg: ResolvedConfig): Promise<void> {
   line(real ? true : false, "Codex 真身", real ?? "未找到（请先安装 Codex CLI 或配置 codexBin）");
 
   const shim = shimStatus();
-  line(shim.installed ? true : "warn", "codex 壳", shim.installed ? `已安装：${shim.path}（敲 codex 即经 cxm）` : "未安装（cxm install 可装；不装也能用 cxm 命令）");
+  if (!shim.installed) {
+    line("warn", "codex 壳", "未安装（cxm install 可装；不装也能用 cxm 命令）");
+  } else if (shim.pathOk) {
+    line(true, "codex 壳", `已安装：${shim.path}（PATH 里排最前，敲 codex 即经 cxm）`);
+  } else {
+    line(
+      "warn",
+      "codex 壳",
+      `已安装但不在 PATH 最前：${shim.path}（敲 codex 会绕过 cxm → 重开终端；仍不行就检查 shell 启动脚本里的 PATH 注入）`,
+    );
+  }
 
   if (real) {
     try {
@@ -296,14 +306,13 @@ async function main(): Promise<void> {
       break;
     }
     case "install":
-      console.log(installShim());
-      console.log('注意：npm 升级 @openai/codex 会重建 codex 链接、冲掉壳，届时重跑 "cxm install" 即可。');
+      console.log(installShim(undefined, { writeRc: !argv.includes("--no-rc") }));
       break;
     case "uninstall":
       console.log(uninstallShim());
       break;
     case "setup": {
-      console.log(installShim());
+      console.log(installShim(undefined, { writeRc: !argv.includes("--no-rc") }));
       const r = writeConfigTemplate();
       console.log(r.created ? `已生成配置模板：${r.path}` : `配置已存在，未覆盖：${r.path}`);
       console.log('\n接下来：编辑上面的配置文件填入各档网关与令牌，然后新开终端敲 "codex" 使用（会话中按 /model 切档）。');
