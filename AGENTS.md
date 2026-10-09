@@ -22,7 +22,7 @@ Codex 多档位即时切换工具：本地网关 + `/model` 选择器选档（�
 npm install --include=dev   # 装 tsc（首次）
 npm run build               # tsc 编译到 dist/ —— 改完代码必须重编
 npm run dev                 # tsc --watch
-npm test                    # test/e2e.sh：本地假上游回归（17 项断言，不联网）
+npm test                    # test/e2e.sh：本地假上游回归（32 项断言，不联网）
 ```
 
 `cxm`、codex 壳执行的都是 `dist/` 产物，**改源码后不 `npm run build` 等于没改**。
@@ -54,7 +54,9 @@ catalog.ts  开窗时生成 ~/.codex-models/model-catalog.json（各档代表名
 | `src/cli.ts` | 命令分发：list/use/sessions/start/stop/status/catalog/init/install/uninstall/setup/doctor/proxy/launch |
 | `src/config.ts` | 配置加载（JSONC）、档位推导（代表名/显示名/协议）、目录定位（CXM_HOME） |
 | `src/catalog.ts` | 模型目录生成：克隆内置模板条目 + 各档位条目 + 工具模式 |
-| `src/proxy.ts` | 核心网关：会话表与生命周期、换档判定、模型改写、转发、管理接口（现约 756 行，接近 800 上限） |
+| `src/proxy.ts` | 核心网关：会话生命周期、换档判定、模型改写、转发、管理接口 |
+| `src/sessions.ts` | 会话表（令牌→会话、pid 存活回收）；从 proxy.ts 拆出以守住单文件行数上限 |
+| `src/bodyLimit.ts` | 请求体读取与体积控制（越限也读完再报错；逼近上游 64MiB 时拦普通轮次、豁免压缩） |
 | `src/translate.ts` | Responses ⇄ Chat Completions 双向转译（含 SSE 事件序列） |
 | `src/adapt.ts` | usage 口径归正（UsageNormalizer）+ 超长报错文案适配（adaptErrorBody） |
 | `src/daemon.ts` | 网关守护进程：探活、分离启动、SIGTERM 停止、管理令牌、pid 文件 |
@@ -106,11 +108,25 @@ catalog.ts  开窗时生成 ~/.codex-models/model-catalog.json（各档代表名
 12. **chat 转译（translate.ts）**：`namespace` 拍平成 `ns.tool`；`custom` 工具映射成
     "单 string 参数 input" 的函数，回包还原成 `custom_tool_call`（`apply_patch` 走这条）；
     `web_search` 丢弃并记日志；reasoning 默认丢弃；非 SSE 响应也能一次性转成事件队。
+13. **体积两道闸门（2026-10-09 实测后定型，见 `CLAUDE.md` 15/16）**：
+    - `maxBodyBytes`（默认 **0 = 不限制**）：cxm 自己不设上限，因为长会话请求体上百 MB 很正常；
+      真要护栏才写数字。撞线**不再掐连接**（旧实现 `req.destroy()` 让客户端只看到一句
+      `error sending request` 且网关不写日志），改成把流读完再回 413 + 文案。
+    - `maxRequestBodyBytes`（默认 **55MiB**）：**上游**有 64MiB 硬限（实测阿里云 token-plan
+      与内网 10.10.77.66 都在 67108864 字节上返回 `BadRequest.TooLarge`）。超阈值且
+      **确认是普通轮次**时**不转发**、直接提示用户 `/compact`。
+      判据刻意是"只拦 `x-codex-turn-metadata.request_kind === "turn"`，其余一律放行"：
+      把压缩误判成普通轮次会让用户永远压不了会话（死锁），反向误判只是再撞一次 413。
+    - `upstreamBodyLimitBytes`（默认 64MiB）：**独立于**上一条、且**检查顺序在前**（不看请求
+      类型）。超过它说明连压缩也放不下（压缩请求同样大）→ 直接提示"用 /new 开新线程"。
+      顺序在前还保证：把上一条关掉（`maxRequestBodyBytes: 0`）时这条依然生效。
+    两者都用 400 而非 413 返回：413 会触发 Codex 无意义重试（`Reconnecting… 2/5`）。
 
 ## 开发约定
 
 - 代码注释、日志文案用**中文**；方法注释详述实现逻辑（为什么这么做，不只是做什么）。
-- 单文件超过 800 行应拆分（`proxy.ts` 接近上限：管理接口、数据面转发、会话表可再拆）。
+- 单文件超过 800 行应拆分（`proxy.ts` 已把会话表拆到 `sessions.ts`、体积控制拆到
+  `bodyLimit.ts`；管理接口、数据面转发这两块将来还可再拆）。
 - 保持**零运行时依赖**：只用 Node 内置模块，不引入 npm 运行时包。
 - **安全红线**：任何输出（日志/报错/调试打印）不得包含上游 `apiKey`（含前缀片段），
   只可打印"键是否存在"、主机名、令牌长度/末尾 4 位。
@@ -125,7 +141,16 @@ catalog.ts  开窗时生成 ~/.codex-models/model-catalog.json（各档代表名
 - `cxm stop` 会让已开窗口失去会话令牌（之后落默认档），重启网关挑没窗口的时候。
 - 改配置删/改档位名后，已开窗口的会话可能指向不存在的档位：要显式回落默认档并写日志，
   否则日志与 `cxm sessions` 会长期显示幽灵档位。
-- 改写 `body.model` 需要完整缓冲请求体（上限 64MB）。
+- 改写 `body.model` 需要完整缓冲请求体；**默认不限制字节数**（配置 `maxBodyBytes` 不写
+  就是 0 = 不限制）。曾经硬编码 64MB 上限：长会话历史里堆够图片就会撞线，客户端只报
+  `stream disconnected before completion: error sending request`，网关还不写日志，
+  连 `/compact` 都发不出去（compact 也要重发整段历史）。详见 `CLAUDE.md`「核心机制 15」。
+- **「Context 还剩很多」不等于「请求不大」**：图片（`input_image` 的 base64）按 token
+  算很便宜、按字节算极大，一张 2MB 截图只算约 1~2k token 但就是 2MB 字节。
+- **上游有 64MiB 请求体硬限**，超了会 413 并让 Codex 连试 5 次（`Reconnecting… 2/5`），
+  而且 `/compact` 也会被同样拒掉（压缩也要重发整段历史）→ 会话锁死。cxm 现在会在
+  55MiB 时拦住普通轮次并提示压缩、同时豁免压缩请求。长会话别把大截图读进上下文，
+  让模型按路径读文件。
 - Codex 大版本升级可能增删目录字段/改协议：升级后 `cxm catalog --refresh`，
   必要时用探针复测（见 `CLAUDE.md`「协议事实」）。
 - `chat` 转译能力上限取决于上游函数调用支持；`web_search` 在 chat 档不可用。

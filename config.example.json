@@ -34,6 +34,29 @@
   // inherit = 沿用 Codex 原生 Code Mode（把工具塞进 additional_tools 输入项，要求模型写 JS 编排）。
   // "toolMode": "classic",
 
+  // 可选：请求体字节上限。**默认不限制**（不写这一项 = 0 = 不限制），
+  // 因为 Codex 每轮都会重发**整段会话历史**，而历史里的图片（input_image 的 base64）
+  // 按 token 算很小、按字节算极大 —— 于是会出现「TUI 显示 Context 还剩 66%，请求却
+  // 被掐断（表现为 stream disconnected before completion: error sending request）」。
+  // 网关要完整缓冲请求体才能改 model，放开限制的代价是内存：实测峰值约为请求体的
+  // 5~10 倍（118MB body → 634MB RSS），网关是所有窗口共享的单点进程。
+  // 真想要一道护栏时再写数字，例如 268435456（256MB）；写 0 或不写即不限制。
+  // "maxBodyBytes": 268435456,
+
+  // 可选：「该压缩会话了」的阈值，**默认 55MiB**（不写这一项就是它；写 0 = 关闭提醒）。
+  // 实测两条上游（阿里云 token-plan 网关、内网 10.10.77.66）都在请求体
+  // 67108864 字节（64MiB）上返回 413 Exceeded limit on max bytes to request body。
+  // 超过本阈值时网关**不再转发**，直接回一条提示让你执行 /compact ——
+  // 目的是冻住体积增长，保证压缩请求还能发出去（否则会话会被上游彻底拒死）。
+  // 压缩请求本身豁免本阈值（它也重发整段历史，拦了就永远压不了）。
+  // 留 9MiB 余量是因为普通轮次的固定开销（系统指令 + 工具 schema）实测只有约 53KB。
+  // "maxRequestBodyBytes": 57671680,
+
+  // 可选：上游请求体的**硬限**，默认 67108864（64MiB，与实测报文里的数字一致）；0 = 关闭检查。
+  // 请求体超过它时连压缩也放不下（压缩同样重发整段历史），cxm 会直接回一条
+  // "请用 /new 开新线程" 的提示，而不是把请求转出去挨上游的 413。
+  // "upstreamBodyLimitBytes": 67108864,
+
   "profiles": {
     // 档位键名会成为选择器里的代表名：cxm-profile-dashscope
     "dashscope": {

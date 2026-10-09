@@ -37,25 +37,21 @@ import {
 } from "./config.js";
 import { UsageNormalizer, adaptErrorBody } from "./adapt.js";
 import { ChatToResponsesStream, responsesToChat } from "./translate.js";
-import { adminToken, clearPidFile, processAlive, writePidFile } from "./daemon.js";
-
-/** 单个会话（一个 Codex 窗口 / 一个进程） */
-interface Session {
-  id: string;
-  /** 身份牌（非凭据）：注册时生成，注入给 Codex 作为 provider 的 env_key 值 */
-  token: string;
-  /** 窗口进程 pid（用于存活探测；未 attach 时为空） */
-  pid?: number;
-  /** 当前档位键 */
-  profile: string;
-  /** 上一次请求里的模型名（用于识别“选择器换档” vs “回声”） */
-  lastMarker: string | null;
-  createdAt: number;
-  lastSeen: number;
-  requests: number;
-  /** 未注册（没经过 cxm 启动）的临时会话：只靠线程头识别，5 分钟空闲回收 */
-  transient: boolean;
-}
+import { adminToken, clearPidFile, writePidFile } from "./daemon.js";
+import {
+  BodyTooLargeError,
+  bodyLimitExemption,
+  buildOverCeilingBody,
+  buildOverThresholdBody,
+  fmtBytes,
+  readBody,
+} from "./bodyLimit.js";
+// 会话表拆到 sessions.ts、体积控制拆到 bodyLimit.ts（各自守住单文件 800 行上限）；
+// 这里再导出一次 Session/SessionStore，保持 `import { … } from "./proxy.js"` 的既有用法不变。
+import { SessionStore } from "./sessions.js";
+import type { Session } from "./sessions.js";
+export { SessionStore } from "./sessions.js";
+export type { Session } from "./sessions.js";
 
 /** 请求上下文（日志与路由用） */
 interface ReqCtx {
@@ -69,110 +65,20 @@ interface ReqCtx {
   droppedReasoning: number;
 }
 
-const BODY_LIMIT = 64 * 1024 * 1024; // 与 cm 一致：要完整缓冲才能改写 body.model
+/**
+ * 管理接口（/__cxm/*）的请求体上限：这些接口只收一小段 JSON，1MB 足够，
+ * 顺带挡住误发过来的大包。数据面的上限走配置 `maxBodyBytes`（见 config.ts）。
+ */
+const ADMIN_BODY_LIMIT = 1024 * 1024;
+/**
+ * 「大请求体」提示阈值：超过它就在日志里留一行体积记录。
+ * 为什么要提示：Codex 每轮重发整段历史，图片（base64）按字节算极大，
+ * 长会话会缓慢逼近阈值；有这条日志才能提前看到“正在逼近”，而不是等到被拦才发现。
+ */
+const BIG_BODY_HINT_BYTES = 8 * 1024 * 1024;
 const EVENT_BUFFER_LIMIT = 8 * 1024 * 1024; // 单个 SSE 事件缓冲上限，超了就原样透传
 const GRACE_MS = 10_000; // 会话清零后的宽限期（防止关一个马上开一个造成抖动）
 const GC_INTERVAL_MS = 15_000;
-const ORPHAN_IDLE_MS = 5 * 60_000; // 无 pid 的临时会话空闲回收时间
-
-/** 会话表 */
-export class SessionStore {
-  private byId = new Map<string, Session>();
-  private byToken = new Map<string, Session>();
-
-  /** 注册一个新会话（launcher 调用），返回身份牌 */
-  register(profile: string, pid?: number): Session {
-    const session: Session = {
-      id: crypto.randomBytes(6).toString("hex"),
-      token: `cxm-${crypto.randomBytes(16).toString("hex")}`,
-      pid,
-      profile,
-      lastMarker: null,
-      createdAt: Date.now(),
-      lastSeen: Date.now(),
-      requests: 0,
-      transient: false,
-    };
-    this.byId.set(session.id, session);
-    this.byToken.set(session.token, session);
-    return session;
-  }
-
-  attach(token: string, pid: number): Session | null {
-    const s = this.byToken.get(token);
-    if (!s) return null;
-    s.pid = pid;
-    return s;
-  }
-
-  detach(token: string): void {
-    const s = this.byToken.get(token);
-    if (!s) return;
-    this.byToken.delete(s.token);
-    this.byId.delete(s.id);
-  }
-
-  /** 按令牌查会话；找不到时按“临时会话”处理（token 也用作区分键） */
-  findOrCreate(token: string, profile: string): { session: Session; created: boolean } {
-    const hit = this.byToken.get(token);
-    if (hit) return { session: hit, created: false };
-    const session: Session = {
-      id: `t-${crypto.createHash("sha1").update(token).digest("hex").slice(0, 10)}`,
-      token,
-      profile,
-      lastMarker: null,
-      createdAt: Date.now(),
-      lastSeen: Date.now(),
-      requests: 0,
-      transient: true,
-    };
-    this.byId.set(session.id, session);
-    this.byToken.set(session.token, session);
-    return { session, created: true };
-  }
-
-  /** 定位会话：支持 token / 会话 id / pid / "last"（最近活跃） */
-  resolve(target: string): Session | null {
-    if (target === "last") return this.mostRecent(null);
-    return (
-      this.byToken.get(target) ||
-      this.byId.get(target) ||
-      [...this.byId.values()].find((s) => String(s.pid) === target) ||
-      null
-    );
-  }
-
-  /** 最近活跃的会话（可排除某个） */
-  mostRecent(exclude: string | null): Session | null {
-    const list = [...this.byId.values()]
-      .filter((s) => s.id !== exclude)
-      .sort((a, b) => b.lastSeen - a.lastSeen);
-    return list[0] ?? null;
-  }
-
-  all(): Session[] {
-    return [...this.byId.values()].sort((a, b) => b.lastSeen - a.lastSeen);
-  }
-
-  /** 回收：pid 挂了的会话删掉；无 pid 的临时会话超时删掉 */
-  gc(): number {
-    let removed = 0;
-    const now = Date.now();
-    for (const s of this.all()) {
-      const pidDead = s.pid !== undefined && !processAlive(s.pid);
-      const orphanExpired = (s.pid === undefined || s.transient) && now - s.lastSeen > ORPHAN_IDLE_MS;
-      if (pidDead || orphanExpired) {
-        this.detach(s.token);
-        removed += 1;
-      }
-    }
-    return removed;
-  }
-
-  get size(): number {
-    return this.byId.size;
-  }
-}
 
 /** 追加一行网关日志（不含任何凭据内容） */
 export function logLine(text: string): void {
@@ -251,25 +157,6 @@ function sendJson(res: ServerResponse, status: number, obj: unknown): void {
   res.end(text);
 }
 
-/** 读取请求体（带上限保护） */
-function readBody(req: IncomingMessage, limit = BODY_LIMIT): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    let size = 0;
-    req.on("data", (c: Buffer) => {
-      size += c.length;
-      if (size > limit) {
-        reject(new Error(`请求体超过上限 ${limit} 字节`));
-        req.destroy();
-        return;
-      }
-      chunks.push(c);
-    });
-    req.on("end", () => resolve(Buffer.concat(chunks)));
-    req.on("error", reject);
-  });
-}
-
 /** 管理接口鉴权：常量时间比较，避免令牌被时序侧信道猜出 */
 function adminOk(req: IncomingMessage): boolean {
   const got = req.headers["x-cxm-admin"];
@@ -299,7 +186,26 @@ async function handleAdmin(req: IncomingMessage, res: ServerResponse, gw: Gatewa
   // 管理接口也要先热加载配置：否则刚在 config.json 里加好的档位，
   // 走 "cxm <档位>" 启动时注册会被判成"未知档位"（数据面热加载了、管理面没加载）。
   gw.reloadIfChanged();
-  const bodyText = req.method === "POST" ? (await readBody(req, 1024 * 1024)).toString("utf-8") : "";
+  let bodyText = "";
+  if (req.method === "POST") {
+    try {
+      bodyText = (await readBody(req, ADMIN_BODY_LIMIT)).toString("utf-8");
+    } catch (e) {
+      if (e instanceof BodyTooLargeError) {
+        logLine(`管理接口请求体超限：${fmtBytes(e.bytes)} > ${fmtBytes(e.limit)}（${pathname}）`);
+        sendJson(res, 413, {
+          error: {
+            message: `管理接口请求体 ${fmtBytes(e.bytes)} 超过上限 ${fmtBytes(e.limit)}`,
+            type: "invalid_request_error",
+            code: "body_too_large",
+          },
+        });
+        return;
+      }
+      sendJson(res, 400, { error: e instanceof Error ? e.message : String(e) });
+      return;
+    }
+  }
   let payload: Record<string, unknown> = {};
   if (bodyText.trim()) {
     try {
@@ -427,11 +333,86 @@ async function handleResponses(req: IncomingMessage, res: ServerResponse, gw: Ga
   gw.reloadIfChanged();
   let raw: Buffer;
   try {
-    raw = await readBody(req);
+    raw = await readBody(req, gw.cfg.maxBodyBytes);
   } catch (e) {
+    if (e instanceof BodyTooLargeError) {
+      // 超限必须留痕：以前这里是“掐断连接 + 不写日志”，现场只能看到客户端一句
+      // 含糊的 error sending request，排查时完全不知道发生了什么。
+      // 只打大小与令牌末尾 4 位，绝不打令牌本身（安全红线）。
+      logLine(
+        `请求体超限被拒：${fmtBytes(e.bytes)} > 上限 ${fmtBytes(e.limit)}（令牌末尾 ${sessionKeyOf(req).slice(-4)}）`,
+      );
+      sendJson(res, 413, {
+        error: {
+          message:
+            `cxm 网关拒绝了超大请求：请求体 ${fmtBytes(e.bytes)} 超过上限 ${fmtBytes(e.limit)}。` +
+            `注意“上下文还剩很多”不等于“请求不大”：Codex 每轮都会重发整段会话历史，` +
+            `历史里的图片（input_image 的 base64）按 token 算很小、按字节算极大。` +
+            `处理办法：① 开新线程 /new 继续；② 在 config.json 里调大 maxBodyBytes（0 = 不限制）。`,
+          type: "invalid_request_error",
+          code: "body_too_large",
+          bytes: e.bytes,
+          limit: e.limit,
+        },
+      });
+      return;
+    }
     sendJson(res, 413, { error: { message: e instanceof Error ? e.message : String(e), type: "invalid_request_error" } });
     return;
   }
+  if (raw.length >= BIG_BODY_HINT_BYTES) {
+    // 体积提示：只记大小，不含任何请求内容。用来提前发现“会话正在逼近阈值”。
+    const cap = gw.cfg.maxRequestBodyBytes > 0 ? fmtBytes(gw.cfg.maxRequestBodyBytes) : "不限制";
+    logLine(`请求体较大：${fmtBytes(raw.length)}（压缩阈值 ${cap}）`);
+  }
+
+  /**
+   * 体积闸门（两道，顺序有讲究）。
+   *
+   * 背景（2026-10-09 实测）：两条上游（阿里云 token-plan、内网 10.10.77.66）都在请求体
+   * 67108864 字节（64MiB）上返回
+   * `413 {"code":"BadRequest.TooLarge","message":"Exceeded limit on max bytes to request body : 67108864"}`。
+   * Codex 的重试逻辑会连打 5 次（界面上 Reconnecting… 2/5）全都白跑，最后只丢给用户一句
+   * 上游 JSON；更糟的是 `/compact` 也一样被拒（压缩同样要重发整段历史），会话就此锁死。
+   *
+   * 两道闸门的分工：
+   *  ① 上游硬限（默认 64MiB）：**任何**请求超过它都拦（压缩也一样，因为压缩的请求体与
+   *     被压缩的那次几乎等大，上游照样 413）→ 直接提示用户开新线程，别再去撞墙。
+   *  ② 压缩阈值（默认 55MiB）：只拦**确认的普通轮次**，放行其余（关键就是放行压缩）→
+   *     提示用户 /compact，并**冻住体积增长**，保证压缩请求一定还发得出去。
+   * 顺序上必须①在前：一个 65MiB 的请求即使提示"去压缩"也没用（压缩请求同样 65MiB），
+   * 直接说"开新线程"才是准确建议；而且这样即使把 ② 关掉（maxRequestBodyBytes: 0），
+   * ① 依然独立生效。
+   *
+   * 两道都在 JSON.parse 之前：真要拦就直接拦，不必先解析一个几十 MB 的对象。
+   */
+  const limit = gw.cfg.maxRequestBodyBytes;
+  const ceiling = gw.cfg.upstreamBodyLimitBytes;
+  const tail = `（令牌末尾 ${sessionKeyOf(req).slice(-4)}）`;
+
+  // —— 闸门①：上游硬限（不看请求类型，谁超谁拦）——
+  if (ceiling > 0 && raw.length > ceiling) {
+    const why = bodyLimitExemption(req);
+    logLine(
+      `请求体超上游硬限被拦（已提示 /new）：${fmtBytes(raw.length)} > ${fmtBytes(ceiling)} ` +
+        `类型=${why || "普通轮次"}${tail}`,
+    );
+    sendJson(res, 400, buildOverCeilingBody(raw.length, ceiling));
+    return;
+  }
+
+  // —— 闸门②：压缩阈值（只拦确认的普通轮次；压缩请求豁免，否则永远压不了 = 死锁）——
+  if (limit > 0 && raw.length > limit) {
+    const why = bodyLimitExemption(req);
+    if (!why) {
+      logLine(`请求体超阈值被拦（已提示 /compact）：${fmtBytes(raw.length)} > ${fmtBytes(limit)}${tail}`);
+      sendJson(res, 400, buildOverThresholdBody(raw.length, limit));
+      return;
+    }
+    // 豁免也要留痕：压缩请求贴着阈值走，是排查“为什么这么大”的关键线索。
+    logLine(`请求体超阈值但豁免转发：${fmtBytes(raw.length)} > ${fmtBytes(limit)}（原因=${why}）${tail}`);
+  }
+
   let body: Record<string, unknown>;
   try {
     body = JSON.parse(raw.toString("utf-8")) as Record<string, unknown>;
@@ -439,6 +420,10 @@ async function handleResponses(req: IncomingMessage, res: ServerResponse, gw: Ga
     sendJson(res, 400, { error: { message: "请求体不是合法 JSON", type: "invalid_request_error" } });
     return;
   }
+  // 解析完就把原始 Buffer 丢弃：默认不限制上限，长会话的请求体常有上百 MB，
+  // 而下面还要 JSON.stringify 出改写后的 body —— 早一步释放能少占一份内存
+  // （实测 118MB 请求体的峰值 RSS 634MB；转发期间只留解析后的对象）。
+  raw = Buffer.alloc(0);
 
   const key = sessionKeyOf(req);
   const { session, created } = gw.sessions.findOrCreate(key, gw.cfg.defaultProfile);
@@ -487,7 +472,7 @@ async function handleResponses(req: IncomingMessage, res: ServerResponse, gw: Ga
   const started = Date.now();
   try {
     if (profile.wireApi === "chat") await forwardChat(req, res, gw, ctx, body, started);
-    else await forwardResponses(req, res, gw, ctx, body, raw, started);
+    else await forwardResponses(req, res, gw, ctx, body, started);
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);
     logLine(`上游请求失败：会话=${session.id} 档位=${profile.key} 错误=${message}`);
@@ -550,14 +535,19 @@ function hostOf(url: string): string {
   }
 }
 
-/** responses 协议：改写 body.model 后直通上游，途中做 usage 归正与超长文案适配 */
+/**
+ * responses 协议：改写 body.model 后直通上游，途中做 usage 归正与超长文案适配。
+ *
+ * 注意这里**不再接收原始 Buffer**：改写模型名走"解析后重新序列化"，原始请求体在
+ * handleResponses 解析完就释放了（长会话的请求体可能有上百 MB，多持有一份就意味着
+ * 峰值 RSS 多一份）。
+ */
 async function forwardResponses(
   req: IncomingMessage,
   res: ServerResponse,
   gw: Gateway,
   ctx: ReqCtx,
   body: Record<string, unknown>,
-  raw: Buffer,
   started: number,
 ): Promise<void> {
   // 改写模型名：直接把解析后的 body 重新序列化（比字符串替换更稳，不怕空格/转义）

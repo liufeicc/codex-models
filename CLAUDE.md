@@ -37,7 +37,9 @@ catalog.ts  开窗时生成 ~/.codex-models/model-catalog.json（各档代表名
 | `src/cli.ts` | 命令分发：list/use/sessions/start/stop/status/catalog/init/install/uninstall/setup/doctor/proxy/launch |
 | `src/config.ts` | 配置加载（JSONC）、档位推导（代表名/显示名/协议）、目录定位（CXM_HOME） |
 | `src/catalog.ts` | 模型目录生成：克隆内置模板条目 + 各档位条目 + 工具模式 |
-| `src/proxy.ts` | 核心网关：会话表与生命周期、换档判定、模型改写、转发、管理接口 |
+| `src/proxy.ts` | 核心网关：会话生命周期、换档判定、模型改写、转发、管理接口 |
+| `src/sessions.ts` | 会话表（令牌→会话、pid 存活回收）；从 proxy.ts 拆出以守住单文件行数上限 |
+| `src/bodyLimit.ts` | 请求体读取与体积控制（越限也读完再报错；逼近上游 64MiB 时拦普通轮次、豁免压缩） |
 | `src/translate.ts` | Responses ⇄ Chat Completions 双向转译（含 SSE 事件序列） |
 | `src/adapt.ts` | usage 口径归正（UsageNormalizer）+ 超长报错文案适配（adaptErrorBody） |
 | `src/codexSync.ts` | 升级 Codex 后自动跟上：守护进程版本倒挂检测 + 无窗口时同步（见核心机制 14） |
@@ -173,6 +175,74 @@ catalog.ts  开窗时生成 ~/.codex-models/model-catalog.json（各档代表名
       三个前置闸门：`autoSyncAppServer:false`、`sharedDaemon:false`（压根没共享守护
       进程）、非默认主目录（隔离实例/测试不许动用户全局 codex 状态 —— e2e 就靠这条
       保证绝不误触发）。`cxm doctor` 会报告这个版本。
+15. **请求体字节上限：默认不限制（`maxBodyBytes`，2026-10-09 事故后的定论）**。
+    背景：网关必须完整缓冲请求体才能改 `body.model`，旧实现硬编码 64MB 上限 + 超限
+    `req.destroy()`。事故现场：某会话 compaction 后累积了 **63.2MB 图片**（113 张 base64
+    截图），加上文本与工具 schema 就越过 64MB，于是
+    - 客户端只看到 `stream disconnected before completion: error sending request`
+      （纯连接层错误，`codex_error_info:"other"`）；
+    - 网关**一行日志都不写**（实测复现：发 70MB body，客户端 67ms 后 ECONNRESET，
+      `proxy.log` 零新增）——现场彻底失明；
+    - **连 `/compact` 也发不出去**，因为 compact 同样要重发整段历史，于是会话被彻底锁死。
+    关键认知：**token 余量与 body 字节数是两个维度**。一张 2MB 截图只算约 1~2k token，
+    所以 TUI 会显示"Context 66% left"，而它在请求体里就是实打实的 2MB 字节。
+    现在的做法：
+    - **默认 0 = 不限制**（配置不写这一项就不设上限），从根上不再掐死正常长会话；
+    - 要护栏时在配置里写数字（如 256MB）。撞线时不再 `destroy`，而是**把流读完**再回
+      413 + 明确文案（Codex 会原样展示错误体）并写日志；管理接口另有 1MB 固定上限；
+    - 请求体 ≥8MB 时日志记一行 `请求体较大：X MB（上限 …）`，用来在逼近上限前就能看见；
+    - 解析完 body 立即释放原始 Buffer（`raw = Buffer.alloc(0)`），少占一份内存。
+    代价（实测）：内存峰值约为请求体的 5~10 倍（64MB→363MB，118MB→634MB RSS），
+    网关是所有窗口共享的单点进程 —— 所以这是个"可诊断性 / 内存"的取舍，默认选了放行。
+    **兜底经验**：长会话里塞过大截图后，最省事的恢复办法是开新线程；让模型按**路径**读图
+    （而不是把图片塞进上下文）能从源头避免这个问题。
+16. **上游的 64MiB 硬限 → 逼近时拦截并提示 `/compact`（`maxRequestBodyBytes`，默认 55MiB）**。
+    15 号机制解决的是"cxm 自己不该设上限"，但**上游有上限**。2026-10-09 实测两条上游
+    （阿里云 token-plan 网关、内网 10.10.77.66）都在 **67108864 字节（恰好 64MiB）** 上返回：
+    ```json
+    413 {"code":"BadRequest.TooLarge","message":"Exceeded limit on max bytes to request body : 67108864"}
+    ```
+    事故现场：某会话请求体 64.2MiB，**只超了 0.31%（约 205KiB）**，于是 Codex 界面上出现
+    `Reconnecting… 2/5`，连着打 5 次全都撞同一面墙，最后把上游那句 JSON 丢给用户 ——
+    期间用户想 `/compact` **也一样被拒**（压缩同样重发整段历史），会话彻底锁死。
+    对策（`bodyLimit.ts`）：
+    - 请求体 > `maxRequestBodyBytes`（默认 **55MiB**）且是**普通轮次** → **不转发**，
+      直接回一条让用户 `/compact` 的提示（文案里讲清"上下文百分比只按 token 算，
+      截图按字节算极大"）。目的是**冻住体积增长**，把配额留给压缩请求。
+    - **判据是"只拦确认的普通轮次"**：按 `x-codex-turn-metadata` 的 `request_kind` 判定 ——
+      实测 Codex 0.162.0 该头是**明文 JSON**：普通轮次 `"turn"`、TUI 里 `/compact`
+      则是 `"compaction"`（两者都已直接抓到，方法见 `bodyLimit.ts` 注释：`exec` 造历史 →
+      `--no-daemon resume` 进 TUI → 发 `/compact`，看假上游收到的头）。
+      **只有 `turn` 才拦，其余一律放行**（压缩、复核、未知取值、头缺失、解析失败全都放行）。
+      这是刻意的安全取向：两种误判代价不对称 —— 把压缩误判成普通轮次会让用户**永远压不了
+      会话**（死锁，且拦路者就是 cxm 自己）；把普通轮次误判成放行只是再撞一次上游 413。
+      二进制里 `request_kind` 附近同时存在 `compaction`/`compact`/`review`/
+      `memory_consolidation`/`prewarm` 等取值字符串，无法百分百确定压缩用的是哪个拼写，
+      所以不枚举"哪些算压缩"。
+    - **第二道检查 `upstreamBodyLimitBytes`（默认 64MiB）**：若连被豁免的请求都超过上游硬限，
+      说明历史已经超了 —— 压缩也救不回来（压缩同样重发整段历史），此时直接回一条
+      "请用 /new 开新线程"的提示，而不是转出去让用户看上游那句含糊的 `BadRequest.TooLarge`。
+      典型场景就是本次改版之前**已经卡住的旧会话**（实测那个是 64.2MiB，只超 0.31%）。
+    - **两道闸门的顺序有讲究**：①上游硬限在前、且**独立于**②（不看请求类型，谁超谁拦），
+      ②压缩阈值在后、只拦确认的普通轮次。理由：65MiB 的请求提示"去压缩"是没用的
+      （压缩请求同样 65MiB），直接说"开新线程"才准确；而且这样把 ② 关掉
+      （`maxRequestBodyBytes: 0`）时 ① 依然生效（先前 ① 嵌在 ② 的 `if` 里，
+      关掉 ② 会连带关掉 ① —— `test/e2e.sh` 已补断言守住）。
+    - 用 **400 而不是 413** 返回：实测 413 会触发 Codex 重试（`Reconnecting… 2/5`），
+      而这种拒绝重试多少次都不会成功。
+    - 留 9MiB 余量的依据：实测一条普通轮次的固定开销（系统指令 + 12 个工具 schema + 几条消息）
+      只有约 **53KB**，所以"被提示时压缩请求一定发得出去"是有保证的。
+    复测方式（`test/e2e.sh` 第 8 组已固化）：把 `maxRequestBodyBytes` 调到 512KB，
+    发 700KB 的 `turn` 应得 400 且文案含 `compact`；同样的体把 `request_kind` 换成
+    `compaction` 应得 200。
+17. **`proxy.ts` 已接近单文件上限，拆出两个兄弟模块**（均为 2026-10-09）：
+    - `sessions.ts`：会话表（令牌→会话、pid 存活回收）。`proxy.ts` 再导出 `Session` /
+      `SessionStore`，所以 `import { … } from "./proxy.js"` 的既有用法不变。
+    - `bodyLimit.ts`：`readBody`（含"越限也把流读完再报错"）、`fmtBytes`、
+      `BodyTooLargeError`、`bodyLimitExemption`（压缩豁免判定）、`buildOverThresholdBody`。
+    注意拆分时**别用"按文本块掐掉"的批量脚本**：`proxy.ts` 里 `handleResponses` /
+    `handleAdmin` 等函数名在多处被引用，误删会连带删掉真正的处理函数（本次踩过，
+    靠 `git checkout -- src/proxy.ts` 重做才干净）。
 
 ## 协议事实（实测 Codex 0.159.3，改动前请复测）
 
@@ -225,8 +295,8 @@ catalog.ts  开窗时生成 ~/.codex-models/model-catalog.json（各档代表名
 ## 开发约定
 
 - 代码注释、日志文案用**中文**；方法注释详述实现逻辑（为什么这么做，而不只是做什么）。
-- 单文件超过 800 行应拆分（proxy.ts 现约 740 行，接近上限：管理接口、数据面转发、
-  会话表三块可再拆）。
+- 单文件超过 800 行应拆分（`proxy.ts` 已把会话表拆到 `sessions.ts`、体积控制拆到
+  `bodyLimit.ts`；管理接口、数据面转发这两块将来还可再拆）。
 - 保持零运行时依赖：只用 Node 内置模块，不引入 npm 运行时包。
 - **安全红线**：任何输出（日志/报错/调试打印）不得包含上游 `apiKey`（含前缀片段），
   只可打印"键是否存在"、主机名、令牌长度/末尾 4 位。
@@ -245,7 +315,7 @@ CXM_HOME=/tmp/cxm-test node dist/cli.js <档位> exec --skip-git-repo-check "hi"
 
 **仓库里已带一套可复跑的回归测试**：`npm test` → `test/e2e.sh` + `test/mocks.mjs`
 （五个假上游：responses 探针 / chat 探针 / 口径异常探针 / 报错探针 / 思维链探针；
-25 项断言覆盖模型改写、令牌替换、工具模式、chat 转译工具闭环、换档三态、usage 归正、
+32 项断言覆盖模型改写、令牌替换、工具模式、chat 转译工具闭环、换档三态、usage 归正、
 文案适配、`dropReasoning` 剔除与日志、升级后自动跟上（目录重抓/复用、同步决策矩阵））。
 改网关代码后先跑它。
 
@@ -285,7 +355,9 @@ CXM_HOME=/tmp/cxm-test node dist/cli.js <档位> exec --skip-git-repo-check "hi"
   但已开窗口的 `/model` 列表看不到新档（要重开窗口）。
 - 网关代码改动不热加载，且 `cxm stop` 会让已开窗口失去会话令牌（之后落默认档），
   重启网关挑没窗口的时候。
-- 改写 `body.model` 需要完整缓冲请求体（上限 64MB）。
+- 改写 `body.model` 需要完整缓冲请求体。**默认不限制字节数**（`maxBodyBytes` 不写 = 0 =
+  不限制）：Codex 每轮重发整段历史，长会话请求体上百 MB 很正常，硬卡上限会把正常会话
+  掐死（见"核心机制 15"）。真要护栏就在配置里写具体字节数（如 268435456 = 256MB）。
 - Codex 大版本升级可能改目录字段/协议：升级后跑 `cxm catalog --refresh`，
   必要时用探针复测（见"协议事实"）。
 - `chat` 转译的能力上限取决于上游对函数调用的支持；`web_search` 在 chat 档不可用；

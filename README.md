@@ -190,6 +190,52 @@ is passed through unchanged. Disable with a profile's `errorAdapt` = `"off"`.
 - **Fallback**: if a window is `kill -9`'d or its terminal closes before it can deregister, the gateway probes each session pid every 15 seconds (`process.kill(pid,0)`) and reaps the dead ones; pid-less temporary sessions are reaped after 5 minutes idle;
 - **Multi-window isolation**: one token per window; the current profile is recorded per token, routing is stateless. The token is just an identity badge, not a credential (the real token lives only in the gateway and never enters argv).
 
+### 8. Request body size: unlimited by default (`maxBodyBytes`)
+
+The gateway must buffer the whole request body to rewrite the marker into the real model name, so
+this used to be capped at 64MB. **It is now unlimited by default** (omitting `maxBodyBytes` means 0
+= no limit), because:
+
+Codex resends the **entire conversation history** on every turn, and images in that history
+(`input_image` base64) are **cheap in tokens but huge in bytes** — a 2MB screenshot costs roughly
+1–2k tokens, so the TUI happily shows "Context 66% left" while it is a solid 2MB of the request
+body. Once a long session accumulates a few dozen screenshots the body easily passes 100MB, which
+produces this very misleading failure:
+
+- the client only reports `stream disconnected before completion: error sending request`;
+- even `/compact` cannot be sent (it resends the whole history too), so the session is locked out.
+
+To add your own guardrail, set a byte count in the config, e.g. `"maxBodyBytes": 268435456` (256MB).
+When a body does hit the limit the gateway now answers 413 with the actual size (Codex shows the
+error body verbatim) and logs it; bodies ≥8MB also get a `请求体较大：X MB` log line so you can see
+it approaching.
+
+> Cost: gateway memory peaks at roughly 5–10× the body size (measured: 64MB → 363MB, 118MB →
+> 634MB RSS), and the gateway is a single process shared by all windows. If memory ever gets tight,
+> set an explicit limit.
+>
+> Fallback advice: after stuffing large screenshots into a long session, the easiest recovery is to
+> **start a new thread**; having the model read images by **path** instead of embedding them avoids
+> the problem at the source.
+
+**Watch out for the upstream's own hard limit.** Two upstreams measured here (the Aliyun token-plan
+gateway and the intranet `10.10.77.66`) both reject request bodies over **67108864 bytes (64MiB)**
+with `413 {"code":"BadRequest.TooLarge","message":"Exceeded limit on max bytes to request body : 67108864"}`.
+When that happens Codex shows `Reconnecting… 2/5` and retries five times (all futile), then just shows
+you the upstream JSON — and `/compact` is rejected the same way (compaction resends the whole history
+too), so the session is locked out.
+
+cxm therefore adds a **soft threshold** `maxRequestBodyBytes` (default **55MiB**): when a request
+exceeds it **and is confirmed to be an ordinary turn**, the gateway **does not forward** and instead
+answers with a message telling you to `/compact`, which freezes body growth and keeps the compaction
+request sendable. The predicate is deliberately "only block a confirmed ordinary turn
+(`request_kind === "turn"`), let everything else through": misclassifying a compaction as an ordinary
+turn would leave you **unable to compact at all**, while the opposite mistake only costs one more 413 —
+the two errors are not symmetric. A second check `upstreamBodyLimitBytes` (default **64MiB**) covers the
+worst case: if even the exempted request exceeds the upstream hard limit, compaction can no longer save
+the session (it resends the whole history too), so cxm tells you to **start a new thread** with `/new`.
+Both answer 400 rather than 413 because 413 makes Codex retry pointlessly (`Reconnecting… 2/5`).
+
 ## Commands
 
 ```bash
@@ -231,7 +277,8 @@ cxm -h | --help          # cxm's own help (not passed through to Codex)
 
 ## Known limitations
 
-- Rewriting `body.model` requires buffering the whole request body (up to 64MB);
+- Rewriting `body.model` requires buffering the whole request body; the size is **unlimited by default** (`maxBodyBytes` omitted = 0 = no limit, see "Request body size" above) — set a byte count yourself if you want a guardrail;
+- **Upstreams commonly enforce a 64MiB request-body hard limit**: going over yields a 413 plus five pointless Codex retries, and `/compact` is rejected the same way; cxm blocks normal turns at 55MiB with a "please compact" message while exempting compaction requests (`maxRequestBodyBytes`);
 - After changing gateway code (`proxy.ts` etc.), you must `cxm stop` and restart (code is not hot-reloaded; config is); `cxm stop` invalidates open windows' session tokens, so their next requests fall back to the default profile — prefer restarting when no windows are open;
 - Catalog entries must carry the system prompt and other required fields, or Codex errors with `failed to parse model_catalog_json … missing field x`; cxm clones built-in entries, but **a major Codex upgrade may add/remove fields** — after upgrading, run `cxm catalog --refresh`;
 - `chat` translation covers text / function calls / custom tools / images; if the upstream returns non-standard events (e.g. tool arguments that aren't a JSON string), cxm falls back to the raw text rather than breaking the session.

@@ -19,6 +19,43 @@ import path from "node:path";
 /** 档位代表名前缀：Codex /model 选择器里显示的“档位开关” */
 export const MARKER_PREFIX = "cxm-profile-";
 
+/**
+ * 请求体上限的默认值：**0 = 不限制**，这是刻意的默认值。
+ *
+ * 背景（2026-10-09 实测事故）：网关必须**完整缓冲**请求体才能改 `body.model`，所以
+ * 原实现硬编码了 64MB 上限。而 Codex 每轮都会把**整段会话历史**重发一遍，历史里的图片
+ * （`input_image` 的 base64）按 token 算很便宜（一张 2MB 截图只算约 1~2k token，所以 TUI
+ * 会显示 “Context 66% left”），按**字节**却很贵。实测某会话 compaction 后累积了 63.2MB
+ * 图片，加上文本与工具 schema 就越过 64MB，请求被网关 RST，Codex 只报
+ * “stream disconnected before completion: error sending request”，连 /compact 都发不出去
+ * （compact 也要重发整个历史）。即：token 余量与 body 字节数是两个维度。
+ *
+ * 默认不限制 = 这类请求一律放行；上限只在用户**显式**配置 `maxBodyBytes` 时才生效。
+ * 代价（实测，见 CLAUDE.md）：内存峰值约为请求体的 5~10 倍（118MB body → 634MB RSS），
+ * 而网关是所有窗口共享的单点进程。真到内存吃紧时，请在配置里设一个具体上限。
+ */
+export const DEFAULT_MAX_BODY_BYTES = 0;
+
+/**
+ * 「该压缩会话了」的阈值默认值：55MiB。
+ *
+ * 55MiB 与上游 64MiB 之间留 9MiB 余量：实测一条普通轮次的固定开销（系统指令 + 12 个工具的
+ * schema + 几条消息）只有约 53KB，所以余量足够保证「被提示时压缩请求仍发得出去」。
+ * 详见 RawConfig.maxRequestBodyBytes 的注释。
+ */
+export const DEFAULT_MAX_REQUEST_BODY_BYTES = 55 * 1024 * 1024;
+
+/**
+ * 上游请求体**硬限**的默认值：64MiB（= 67108864 字节，与实测报文里的数字一致）。
+ *
+ * 为什么单独一个值：55MiB 那道阈值只拦"普通轮次"，好让压缩请求能通过。但若历史已经
+ * **超过上游硬限**（典型场景：这次改版之前就已经卡住的旧会话），压缩请求也会被上游 413，
+ * 而 cxm 因为豁免它只能把它转出去、再看着上游回一句含糊的 JSON。此时直接告诉用户
+ * "压缩也放不下，请开新线程"才是真正有用的提示。
+ * 设 0 = 关闭这道检查（例如换了没有该硬限的上游）。
+ */
+export const DEFAULT_UPSTREAM_BODY_LIMIT_BYTES = 64 * 1024 * 1024;
+
 /** 一个档位（用户写在 config.json 里的形态） */
 export interface ProfileConfig {
   /** 显示名（可选，仅用于日志/列表，选择器里显示的是“档位键 · 主模型”） */
@@ -82,6 +119,41 @@ export interface RawConfig {
   autoSyncAppServer?: boolean;
   /** 全局工具模式（档位可单独覆盖）：classic（默认）/ inherit */
   toolMode?: "classic" | "inherit";
+  /**
+   * 请求体字节上限：**默认 0 = 不限制**（不写这一项就是没有上限）。
+   *
+   * 网关要完整缓冲请求体才能改 body.model，内存峰值约为 body 的 5~10 倍；默认放开是因为
+   * Codex 每轮重发整段历史（图片按字节算极大），长会话很容易撞线，而撞线对客户端只表现为
+   * 一句含糊的 “error sending request”。真需要护栏时在这里写一个具体字节数
+   * （例如 268435456 = 256MB）；写 0 或删掉这一项即不限制。
+   */
+  maxBodyBytes?: number;
+  /**
+   * 「该压缩会话了」的请求体阈值：**默认 55MiB**（不写这一项就是它；写 0 = 关闭这个提醒）。
+   *
+   * 为什么需要（2026-10-09 实测）：实测两条上游（阿里云 token-plan 网关、内网 10.10.77.66）
+   * 都在请求体 **67108864 字节（64MiB）** 上返回
+   * `413 {"code":"BadRequest.TooLarge","message":"Exceeded limit on max bytes to request body : 67108864"}`。
+   * 而 Codex 每轮重发整段历史，历史里的截图（base64）按字节算极大 —— 于是会话会毫无预告地
+   * 在某一轮突然被上游拒绝，用户只看到一句 413 加 5 次无意义的重试。
+   *
+   * 做法：请求体超过本阈值时，网关**不转发**，直接回一条让用户 `/compact` 的提示。
+   * 选 55MiB 是为了给上游 64MiB 留 9MiB 余量（工具 schema + 指令只有约 50KB，绰绰有余），
+   * 从而保证"被提示时，压缩请求本身一定还能发得出去"。
+   *
+   * 关键细节：**压缩（/compact）请求豁免本阈值**——压缩请求同样要重发整段历史，
+   * 如果一并拦下，用户就永远压不了会话（死锁）。拦住普通请求的目的正是冻住体积、
+   * 让压缩请求能通过；压缩成功后历史被摘要替换，体积立刻回落。
+   */
+  maxRequestBodyBytes?: number;
+  /**
+   * 上游请求体的**硬限**（字节）：**默认 67108864（64MiB）**，0 = 关闭这道检查。
+   *
+   * 实测阿里云 token-plan 网关与内网 10.10.77.66 都在这个数字上返回
+   * `413 BadRequest.TooLarge`。请求体超过它时，**连压缩请求都没法通过**，
+   * 于是 cxm 直接回一条"请开新线程"的提示，而不是把请求转出去、让用户看上游的含糊 JSON。
+   */
+  upstreamBodyLimitBytes?: number;
   profiles?: Record<string, ProfileConfig>;
 }
 
@@ -122,6 +194,12 @@ export interface ResolvedConfig {
   autoSyncAppServer: boolean;
   /** 全局工具模式（档位可单独覆盖）：classic（默认）/ inherit */
   toolMode: "classic" | "inherit";
+  /** 请求体字节上限；默认 0 = 不限制（见 RawConfig.maxBodyBytes 注释） */
+  maxBodyBytes: number;
+  /** 「该压缩会话了」的请求体阈值；默认 55MiB，0 = 关闭（见 RawConfig.maxRequestBodyBytes 注释） */
+  maxRequestBodyBytes: number;
+  /** 上游请求体硬限；默认 64MiB，0 = 关闭（见 RawConfig.upstreamBodyLimitBytes 注释） */
+  upstreamBodyLimitBytes: number;
   profiles: Record<string, ResolvedProfile>;
   /** 档位顺序（= 配置文件里的书写顺序，决定选择器里的排序） */
   order: string[];
@@ -326,6 +404,41 @@ export function loadConfig(): ResolvedConfig {
   const port = raw.port ?? 4171;
   if (!Number.isInteger(port) || port <= 0 || port > 65535) throw new Error(`port 非法：${raw.port}`);
 
+  // 请求体上限：不写这一项 = 0 = 不限制（默认放行）；写了正数就按该值卡；
+  // 只有负数才报错——写成 -1 多半是笔误，静默当“不限制”会让人误以为护栏还在。
+  let maxBodyBytes = DEFAULT_MAX_BODY_BYTES;
+  if (raw.maxBodyBytes !== undefined) {
+    if (typeof raw.maxBodyBytes !== "number" || !Number.isFinite(raw.maxBodyBytes)) {
+      throw new Error(`maxBodyBytes 必须是数字（0 = 不限制）：${String(raw.maxBodyBytes)}`);
+    }
+    if (raw.maxBodyBytes < 0) throw new Error(`maxBodyBytes 不能为负数（0 = 不限制）：${raw.maxBodyBytes}`);
+    maxBodyBytes = raw.maxBodyBytes === 0 ? 0 : Math.floor(raw.maxBodyBytes);
+  }
+
+  // 「该压缩会话了」的阈值：默认 55MiB；显式写 0 表示关闭这个提醒；负数报错（多半是笔误）。
+  let maxRequestBodyBytes = DEFAULT_MAX_REQUEST_BODY_BYTES;
+  if (raw.maxRequestBodyBytes !== undefined) {
+    if (typeof raw.maxRequestBodyBytes !== "number" || !Number.isFinite(raw.maxRequestBodyBytes)) {
+      throw new Error(`maxRequestBodyBytes 必须是数字（0 = 关闭提醒）：${String(raw.maxRequestBodyBytes)}`);
+    }
+    if (raw.maxRequestBodyBytes < 0) {
+      throw new Error(`maxRequestBodyBytes 不能为负数（0 = 关闭提醒）：${raw.maxRequestBodyBytes}`);
+    }
+    maxRequestBodyBytes = Math.floor(raw.maxRequestBodyBytes);
+  }
+
+  // 上游硬限：默认 64MiB；同样 0 = 关闭，负数报错。
+  let upstreamBodyLimitBytes = DEFAULT_UPSTREAM_BODY_LIMIT_BYTES;
+  if (raw.upstreamBodyLimitBytes !== undefined) {
+    if (typeof raw.upstreamBodyLimitBytes !== "number" || !Number.isFinite(raw.upstreamBodyLimitBytes)) {
+      throw new Error(`upstreamBodyLimitBytes 必须是数字（0 = 关闭检查）：${String(raw.upstreamBodyLimitBytes)}`);
+    }
+    if (raw.upstreamBodyLimitBytes < 0) {
+      throw new Error(`upstreamBodyLimitBytes 不能为负数（0 = 关闭检查）：${raw.upstreamBodyLimitBytes}`);
+    }
+    upstreamBodyLimitBytes = Math.floor(raw.upstreamBodyLimitBytes);
+  }
+
   return {
     configPath: file,
     host: raw.host ?? "127.0.0.1",
@@ -337,6 +450,9 @@ export function loadConfig(): ResolvedConfig {
     sharedDaemon: raw.sharedDaemon !== false,
     autoSyncAppServer: raw.autoSyncAppServer !== false,
     toolMode: raw.toolMode === "inherit" ? "inherit" : "classic",
+    maxBodyBytes,
+    maxRequestBodyBytes,
+    upstreamBodyLimitBytes,
     profiles,
     order,
   };

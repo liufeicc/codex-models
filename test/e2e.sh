@@ -175,6 +175,53 @@ import('$ROOT/dist/codexSync.js').then(m=>{
 });")
 check "同步决策矩阵（只在无窗口时动手）" "$DM" "skip,sync,warn,warn,skip,skip"
 
+echo "== 8) 请求体体积阈值：拦普通轮次、豁免压缩轮次 =="
+# 背景（2026-10-09 实测）：两条上游都在 67108864 字节（64MiB）上返回 413。
+# 网关改用 maxRequestBodyBytes（默认 55MiB）在逼近时拦住并提示 /compact；
+# 压缩请求（x-codex-turn-metadata.request_kind=compaction）必须豁免，否则一旦超阈值
+# 用户就永远压不了会话（死锁）——这正是这条断言要守住的行为。
+cp "$CXM_HOME/config.json" "$CXM_HOME/config.json.bak"
+python3 - "$CXM_HOME/config.json" "$CXM_E2E_DIR/big-body.json" <<'PY'
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+cfg["maxRequestBodyBytes"] = 524288          # 512KB，方便用小体积测出拦截
+json.dump(cfg, open(sys.argv[1], "w"), ensure_ascii=False, indent=2)
+body = {"model": "cxm-profile-probe", "stream": True,
+        "input": [{"type": "message", "role": "user",
+                   "content": [{"type": "input_text", "text": "a" * 700000}]}]}
+open(sys.argv[2], "w").write(json.dumps(body))
+PY
+# 阈值是热加载的：下一次请求就会读到新配置
+big_req() {
+  curl -sS -o "$CXM_E2E_DIR/big.out" -w '%{http_code}' -X POST \
+    -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+    -H "x-codex-turn-metadata: {\"request_kind\":\"$1\"}" \
+    --data-binary "@$CXM_E2E_DIR/big-body.json" "http://127.0.0.1:$PORT/v1/responses"
+}
+check "超阈值 + 普通轮次被拦下（400）" "$(big_req turn)" "400"
+check "拦截文案告诉用户去 /compact" "$(grep -c 'compact' "$CXM_E2E_DIR/big.out")" "1"
+# 非普通轮次（压缩/复核等）必须豁免：否则一旦超阈值用户就永远压不了会话（死锁）。
+# 判据刻意是"只拦确认的 turn"，所以这里同时验证 compaction 与一个未知取值都放行。
+check "超阈值 + 压缩轮次仍放行（200）" "$(big_req compaction)" "200"
+check "超阈值 + 未知 request_kind 也放行（200）" "$(big_req something_new)" "200"
+# 但若连豁免的请求都超过上游硬限，就没什么可救的了 → 提示开新线程（400），不再转出去挨 413
+python3 - "$CXM_HOME/config.json" <<'PYX'
+import json, sys
+cfg = json.load(open(sys.argv[1])); cfg["upstreamBodyLimitBytes"] = 262144   # 256KB < 700KB 的测试体
+json.dump(cfg, open(sys.argv[1], "w"), ensure_ascii=False, indent=2)
+PYX
+check "压缩请求超上游硬限 → 提示开新线程（400）" "$(big_req compaction)" "400"
+check "该提示确实让用户 /new" "$(grep -c '/new' "$CXM_E2E_DIR/big.out")" "1"
+# 闸门①（上游硬限）必须独立于闸门②：把 ② 关掉后 ① 仍要生效，
+# 否则用户一旦配置 maxRequestBodyBytes: 0 就会绕过上游硬限检查、白撞 5 次 413。
+python3 - "$CXM_HOME/config.json" <<'PYZ'
+import json, sys
+cfg = json.load(open(sys.argv[1])); cfg["maxRequestBodyBytes"] = 0
+json.dump(cfg, open(sys.argv[1], "w"), ensure_ascii=False, indent=2)
+PYZ
+check "关掉阈值②后闸门①仍独立生效（400）" "$(big_req turn)" "400"
+mv "$CXM_HOME/config.json.bak" "$CXM_HOME/config.json"
+
 echo
 echo "===== 结果：通过 $PASS 项，失败 $FAIL 项 ====="
 [ "$FAIL" = "0" ] || exit 1
