@@ -40,6 +40,7 @@ catalog.ts  开窗时生成 ~/.codex-models/model-catalog.json（各档代表名
 | `src/proxy.ts` | 核心网关：会话表与生命周期、换档判定、模型改写、转发、管理接口 |
 | `src/translate.ts` | Responses ⇄ Chat Completions 双向转译（含 SSE 事件序列） |
 | `src/adapt.ts` | usage 口径归正（UsageNormalizer）+ 超长报错文案适配（adaptErrorBody） |
+| `src/codexSync.ts` | 升级 Codex 后自动跟上：守护进程版本倒挂检测 + 无窗口时同步（见核心机制 14） |
 | `src/daemon.ts` | 网关守护进程：探活、分离启动、SIGTERM 停止、管理令牌、pid 文件 |
 | `src/codexBin.ts` | 定位 Codex 真身、装/卸 codex 壳（防递归 + 先 unlink + 清理历史遗留旧壳） |
 | `src/shellPath.ts` | 把壳所在目录写进 shell 启动脚本的 PATH（幂等注入 + 精确移除） |
@@ -151,6 +152,27 @@ catalog.ts  开窗时生成 ~/.codex-models/model-catalog.json（各档代表名
     代价：连自家的思维链也丢掉，纯单档长会话连贯性略降 —— 所以**默认 false**，
     不要全局打开。删除是安全的：reasoning 条目不被别的条目引用
     （`function_call` 靠自己的 `id`/`call_id` 配对）。
+14. **升级 Codex 后有两样东西会自动跟上（codexSync.ts / catalog.ts）**，不用人手跑命令：
+    - **模型目录缓存**：条目元数据是克隆 `codex debug models` 的输出来的，而 Codex
+      解析 `model_catalog_json` 是**严格**的 —— 新版新增必填字段就会
+      `failed to parse ... missing field x`，窗口直接起不来（2026-10-08 复现：删掉
+      `priority` 等字段造"旧目录"，codex 报错）。旧实现只在"缓存文件不存在"时抓一次，
+      升级后会一直沿用旧 schema，而且 `cxm doctor` 只查 JSON 能否解析、**还报全绿**。
+      现在缓存里记 `codexIdentity`（版本优先，读不到退化为 mtime+size 文件戳），
+      与本机真身不一致就重抓（`codex debug models` 只要 0.13 秒），
+      同时把生成的目录一并重建（`ensureCatalog` 的 `needs` 也纳入这个判断，
+      否则会出现"缓存重抓了、生成的目录还是旧的"）。
+    - **app-server 守护进程**：它是 Codex **钉住的独立包**（`~/.codex/packages/
+      app-server-daemon/`，`current` 符号链接指向 `releases/<版本目录>`，目录名不可靠
+      —— 钉住的那份叫 `local-<sha256>-<target>`，所以版本要从里面的
+      `codex-package.json` 读）。本机被 codex 判成 `install method: other` →
+      `manual or unknown`，加上版本探测要连 chatgpt.com（本机超时），**永远不会自己跟进**。
+      同步命令 `codex app-server daemon update --from-cli -y` 会**重启守护进程、打断
+      正在跑的窗口**，所以规则是：**无窗口才自动同步，有窗口（或窗口数查不到）只写
+      日志提示**（判定抽成纯函数 `decideAppServerSync` 便于测试）。
+      三个前置闸门：`autoSyncAppServer:false`、`sharedDaemon:false`（压根没共享守护
+      进程）、非默认主目录（隔离实例/测试不许动用户全局 codex 状态 —— e2e 就靠这条
+      保证绝不误触发）。`cxm doctor` 会报告这个版本。
 
 ## 协议事实（实测 Codex 0.159.3，改动前请复测）
 
@@ -223,8 +245,9 @@ CXM_HOME=/tmp/cxm-test node dist/cli.js <档位> exec --skip-git-repo-check "hi"
 
 **仓库里已带一套可复跑的回归测试**：`npm test` → `test/e2e.sh` + `test/mocks.mjs`
 （五个假上游：responses 探针 / chat 探针 / 口径异常探针 / 报错探针 / 思维链探针；
-21 项断言覆盖模型改写、令牌替换、工具模式、chat 转译工具闭环、换档三态、usage 归正、
-文案适配、`dropReasoning` 剔除与日志）。改网关代码后先跑它。
+25 项断言覆盖模型改写、令牌替换、工具模式、chat 转译工具闭环、换档三态、usage 归正、
+文案适配、`dropReasoning` 剔除与日志、升级后自动跟上（目录重抓/复用、同步决策矩阵））。
+改网关代码后先跑它。
 
 假上游套路（本次联调用过，可复用）：
 
@@ -249,6 +272,12 @@ CXM_HOME=/tmp/cxm-test node dist/cli.js <档位> exec --skip-git-repo-check "hi"
 - 升级 Codex 不再需要重跑 `cxm install`（壳在自己的目录里）；老版本装的壳仍在
   npm 全局 bin 目录时，跑一次 `cxm install` 会自动搬走。若 `cxm doctor` 提示"壳不在
   PATH 最前"，说明那行 PATH 注入没生效（比如用了 fish、或启动脚本里又有更晚的 PATH 改动）。
+- **升级 Codex 只需 `npm i -g @openai/codex` 一条命令**：目录缓存与守护进程同步都已
+  自动（见"核心机制 14"）。仍要留意的：网关代码/配置改动不热加载（`cxm stop && cxm start`）；
+  模型目录在**开窗时固化**，升级后要重开窗口才看到新档位；守护进程自动同步只在"无窗口"时
+  发生，所以**开着窗口升级**会看到一行日志提示、需要你关掉窗口后再开一次。
+- 升级后若 `cxm doctor` 报"app-server 倒挂"而手边有窗口没法关：可以先把配置里
+  `sharedDaemon` 设 false（`--no-daemon`）绕开共享守护进程，它就不参与协作了。
 - `cxm install` 可重复执行（幂等）；`cxm uninstall` 会按 `state.json` 还原原生命令。
 - `cxm -h` / `cxm --help` 打印 cxm 自己的帮助；只有走 `launch` 子命令的 codex 壳
   才把 `--help` 原样透传给 Codex 真身（保持 `codex --help` 的行为一致）。

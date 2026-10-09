@@ -20,6 +20,7 @@ import { ResolvedConfig, ProfileConfig } from "./config.js";
 import { adminFetch, ensureDaemon } from "./daemon.js";
 import { ensureCatalog } from "./catalog.js";
 import { resolveRealCodex } from "./codexBin.js";
+import { syncAppServerWithCli } from "./codexSync.js";
 import { logLine } from "./proxy.js";
 
 /** 注入给 Codex 的 provider id（写成配置里的 model_provider 值） */
@@ -106,6 +107,10 @@ export async function launchCodex(cfg: ResolvedConfig, profileKey: string, userA
     );
   }
   await ensureDaemon(cfg);
+  // 升级 Codex 后守护进程会版本倒挂，且它自己不会跟上。这里检测并按"当前有没有
+  // 别的窗口"决定是否自动同步（同步会重启守护进程，有窗口时只提示，见 codexSync.ts）。
+  // 放在 registerSession 之前：此刻算出来的窗口数是"别的窗口"，不含自己。
+  await syncAppServerWithCli(cfg, realCodex);
   const catalogFile = ensureCatalog(cfg, realCodex, { quiet: true });
   const { sessionId, token, marker } = await registerSession(cfg, profileKey);
   const args = buildCodexArgs(cfg, marker, catalogFile, userArgs);

@@ -70,6 +70,16 @@ export interface RawConfig {
   extraArgs?: string[];
   /** false = 启动 codex 时带 --no-daemon */
   sharedDaemon?: boolean;
+  /**
+   * 开窗时自动同步 app-server 守护进程的版本（默认 true）。
+   *
+   * 背景：守护进程是 Codex 自己钉住的一份独立包，本机被它判成 manual 更新模式，
+   * 永远不会自己跟进 —— 升级 codex 后会出现"客户端 0.161.0 / 守护进程 0.159.3"
+   * 的版本倒挂。同步动作（`codex app-server daemon update --from-cli -y`）会**重启**
+   * 守护进程、打断正在跑的窗口，所以 cxm 只在"当前没有任何窗口"时才自动动手，
+   * 有窗口时降级为日志提示（见 codexSync.ts）。设 false 可完全关掉这个行为。
+   */
+  autoSyncAppServer?: boolean;
   /** 全局工具模式（档位可单独覆盖）：classic（默认）/ inherit */
   toolMode?: "classic" | "inherit";
   profiles?: Record<string, ProfileConfig>;
@@ -108,6 +118,8 @@ export interface ResolvedConfig {
   catalogTemplate?: string;
   extraArgs: string[];
   sharedDaemon: boolean;
+  /** 开窗时是否自动同步 app-server 守护进程版本（无窗口时才会真动手），见 RawConfig 注释 */
+  autoSyncAppServer: boolean;
   /** 全局工具模式（档位可单独覆盖）：classic（默认）/ inherit */
   toolMode: "classic" | "inherit";
   profiles: Record<string, ResolvedProfile>;
@@ -323,6 +335,7 @@ export function loadConfig(): ResolvedConfig {
     catalogTemplate: raw.catalogTemplate,
     extraArgs: raw.extraArgs ?? [],
     sharedDaemon: raw.sharedDaemon !== false,
+    autoSyncAppServer: raw.autoSyncAppServer !== false,
     toolMode: raw.toolMode === "inherit" ? "inherit" : "classic",
     profiles,
     order,

@@ -23,6 +23,13 @@
   // 可选：false = 启动 Codex 时加 --no-daemon（不用共享后台服务，隔离性最强）
   // "sharedDaemon": true,
 
+  // 可选：开窗时自动同步 app-server 守护进程的版本（默认 true）。
+  // 守护进程是 Codex 钉住的独立包，升级 codex 后不会自己跟进（本机被它判成 manual
+  // 更新模式），于是出现"客户端 0.161.0 / 守护进程 0.159.3"的倒挂。同步命令会**重启**
+  // 守护进程、打断正在跑的窗口，所以 cxm 只在"当前没有任何窗口"时才自动动手，
+  // 有窗口时降级为写日志提示。设 false 可完全关掉这个行为。
+  // "autoSyncAppServer": true,
+
   // 可选：工具模式。classic（默认）= 顶层 tools + 普通函数调用，第三方模型/网关兼容性最好；
   // inherit = 沿用 Codex 原生 Code Mode（把工具塞进 additional_tools 输入项，要求模型写 JS 编排）。
   // "toolMode": "classic",

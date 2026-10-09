@@ -20,6 +20,7 @@ import { ResolvedConfig, loadConfig, logPath, writeConfigTemplate } from "./conf
 import { adminFetch, daemonStatus, ensureDaemon, stopDaemon } from "./daemon.js";
 import { ensureCatalog, listTemplates, pickTemplate, readBuiltinCatalog } from "./catalog.js";
 import { installShim, resolveRealCodex, shimStatus, uninstallShim } from "./codexBin.js";
+import { appServerStatusLine } from "./codexSync.js";
 import { launchCodex } from "./launch.js";
 import { startGateway } from "./proxy.js";
 
@@ -230,6 +231,9 @@ async function cmdDoctor(cfg: ResolvedConfig): Promise<void> {
     } catch (e) {
       line(false, "模型目录", e instanceof Error ? e.message : String(e));
     }
+    // 守护进程版本倒挂：只报告，不动手（真要同步得确认没有窗口在跑，那是开窗时的活）
+    const asc = appServerStatusLine(real);
+    line(asc.ok ? true : "warn", "app-server", asc.text);
   }
 
   const st = await daemonStatus(cfg);

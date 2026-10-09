@@ -31,6 +31,7 @@ import {
   catalogPath,
   configMtimeMs,
 } from "./config.js";
+import { codexIdentity } from "./codexBin.js";
 
 /** 模型目录条目（字段随 Codex 版本变化，这里只约束我们真正用到的） */
 export interface CatalogEntry {
@@ -51,17 +52,52 @@ export interface CatalogEntry {
 const TEMPLATE_PREFERENCE = ["gpt-6.1-sol", "gpt-6-sol", "gpt-6-astra", "gpt-5.6-terra", "gpt-5.6-sol"];
 
 /**
+ * 内置目录缓存文件的结构（cxm 私有，永远不会交给 Codex，可以自由加字段；
+ * 注意**不要**给 model-catalog.json 加字段 —— 那个文件 Codex 会严格解析）。
+ */
+interface BuiltinCatalogCache {
+  /** 抓取这份缓存时的 codex 身份串（见 codexIdentity）；缺失 = 老格式缓存，视为过期 */
+  codexIdentity?: string;
+  models?: CatalogEntry[];
+}
+
+/** 读缓存里记的 codex 身份；文件不存在 / 坏了 / 老格式都返回 undefined（一律判成过期） */
+function cachedCodexIdentity(cache: string): string | undefined {
+  try {
+    return (JSON.parse(fs.readFileSync(cache, "utf-8")) as BuiltinCatalogCache).codexIdentity;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * 内置目录缓存是否已过期：缓存里记的 codex 身份与当前真身不一致。
+ *
+ * 为什么不能只看「缓存文件在不在」（实测教训）：
+ *  Codex 解析 model_catalog_json 是**严格**的 —— 少了必填字段直接
+ *  `failed to parse model_catalog_json ... missing field x`，窗口根本起不来。
+ *  而条目元数据是克隆 `codex debug models` 的输出得来的，schema 会随版本变。
+ *  旧实现只在"缓存不存在"时抓一次，于是升级 Codex 后目录会一直沿用旧 schema，
+ *  且 cxm doctor 只查 JSON 能不能解析，还报全绿 —— 用户完全看不出问题在哪。
+ *  （2026-10-08 复现：人为删掉 priority 等字段造一份"旧目录"，codex 直接解析失败。）
+ */
+export function builtinCatalogStale(codexBin: string): boolean {
+  return cachedCodexIdentity(builtinCatalogCachePath()) !== codexIdentity(codexBin);
+}
+
+/**
  * 读取内置模型目录：
  *  1. 优先用本地缓存 ~/.codex-models/builtin-catalog.json（无网络、快）；
- *  2. 缓存缺失或显式 refresh 时执行 `codex debug models` 重新抓取。
+ *  2. 缓存缺失、explicit refresh、或**缓存对应的 codex 身份已变**时，执行
+ *     `codex debug models` 重新抓取（只要 0.13 秒，升级后多花这点时间换正确性）。
  * 注意：这里必须用 Codex **真身**（不能用壳），且只是本地命令，不发网络请求。
  */
 export function readBuiltinCatalog(codexBin: string, refresh = false): CatalogEntry[] {
   const cache = builtinCatalogCachePath();
   if (!refresh && fs.existsSync(cache)) {
     try {
-      const cached = JSON.parse(fs.readFileSync(cache, "utf-8")) as { models?: CatalogEntry[] };
-      if (cached.models?.length) return cached.models;
+      const cached = JSON.parse(fs.readFileSync(cache, "utf-8")) as BuiltinCatalogCache;
+      if (cached.models?.length && cached.codexIdentity === codexIdentity(codexBin)) return cached.models;
     } catch {
       /* 缓存坏了就重新抓 */
     }
@@ -76,7 +112,9 @@ export function readBuiltinCatalog(codexBin: string, refresh = false): CatalogEn
   const models = parsed.models ?? [];
   if (models.length === 0) throw new Error(`Codex 内置模型目录为空（${codexBin} debug models）`);
   fs.mkdirSync(path.dirname(cache), { recursive: true, mode: 0o700 });
-  fs.writeFileSync(cache, JSON.stringify(parsed, null, 2), { mode: 0o600 });
+  // 连同"这份缓存是哪个 codex 抓的"一起记下：下次开窗就能靠身份串判断要不要重抓
+  const record: BuiltinCatalogCache = { codexIdentity: codexIdentity(codexBin), models };
+  fs.writeFileSync(cache, JSON.stringify(record, null, 2), { mode: 0o600 });
   return models;
 }
 
@@ -169,7 +207,10 @@ export function ensureCatalog(cfg: ResolvedConfig, codexBin: string, opts: { ref
   const needs =
     opts.refresh ||
     !fs.existsSync(file) ||
-    fs.statSync(file).mtimeMs < configMtimeMs();
+    fs.statSync(file).mtimeMs < configMtimeMs() ||
+    // 内置目录缓存过期（codex 换版本了）也算需要重建：否则会出现
+    // "缓存重抓了、生成的目录还是旧的"——两者必须一起走。
+    builtinCatalogStale(codexBin);
   if (!needs) return file;
   const builtin = readBuiltinCatalog(codexBin, opts.refresh);
   const catalog = buildCatalog(cfg, builtin);

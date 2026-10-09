@@ -8,7 +8,8 @@
 #   4) usage 口径归正（Anthropic 口径自动补 cached）
 #   5) 超长报错文案适配
 #   6) dropReasoning：按档位剔除跨上游的 reasoning（思维链）条目
-#   7) 与用户 ~/.codex、~/.codex-models 完全隔离（只写 CXM_E2E_DIR），并显式钉住 Codex 真身
+#   7) 升级 Codex 后自动跟上：目录缓存按 codex 身份重抓 + 守护进程同步决策矩阵
+#   8) 与用户 ~/.codex、~/.codex-models 完全隔离（只写 CXM_E2E_DIR），并显式钉住 Codex 真身
 #
 # 用法：npm run build && bash test/e2e.sh
 set -u
@@ -133,6 +134,46 @@ check "默认档位原样透传 reasoning 条目" "$(rsn_types)" '["reasoning", 
 check "dropReasoning 档位剔除 reasoning 条目" "$(python3 -c "import sys,json; print(json.dumps(json.loads(open('$CXM_E2E_DIR/logs/rsn.jsonl').readlines()[1])['inputTypes'], ensure_ascii=False))")" '["message"]'
 check "上游收到的模型已改写" "$(python3 -c "import sys,json; print(json.loads(open('$CXM_E2E_DIR/logs/rsn.jsonl').readlines()[1])['model'])")" "drop-real-model"
 check_at_least "网关日志记录了丢弃条数" "$(grep -c '丢弃思维链=1条' "$CXM_HOME/run/proxy.log" || true)" 1
+
+echo
+echo "== 7) 升级 Codex 后自动跟上 =="
+# 7a) 内置目录缓存"身份过期"（换了 codex 版本）→ 必须自动重抓，并把生成的目录一并重建。
+# 这里同时把 model-catalog.json 的 mtime 调到比 config.json 新，确保重建只能是
+# "身份过期"触发的 —— 否则 mtime 规则会先命中，测不到我们新加的判断。
+python3 - "$CXM_HOME" <<'PY'
+import json, os, sys, time
+home = sys.argv[1]
+bc, mc = os.path.join(home, "builtin-catalog.json"), os.path.join(home, "model-catalog.json")
+d = json.load(open(bc)); d["codexIdentity"] = "v:0.0.0-bogus"; json.dump(d, open(bc, "w"), ensure_ascii=False)
+g = json.load(open(mc)); g["models"] = g["models"][:1]; json.dump(g, open(mc, "w"), ensure_ascii=False)
+now = time.time() + 10; os.utime(mc, (now, now))
+PY
+cxm catalog >/dev/null
+EXPECT_ID="$(node -e "import('$ROOT/dist/codexBin.js').then(m=>console.log(m.codexIdentity('$REAL_CODEX')))")"
+check "身份过期的内置缓存被重抓" "$(python3 -c "import json;print(json.load(open('$CXM_HOME/builtin-catalog.json'))['codexIdentity'])")" "$EXPECT_ID"
+check "生成的目录被一并重建" "$(python3 -c "
+import json
+cfg = json.load(open('$CXM_HOME/config.json'))
+cat = json.load(open('$CXM_HOME/model-catalog.json'))
+print('yes' if len(cat['models']) == len(cfg['profiles']) else f\"no({len(cat['models'])}vs{len(cfg['profiles'])})\")")" "yes"
+# 7b) 身份一致时不该重复抓取：往缓存里塞个哨兵，再强制走一次重建路径
+python3 - "$CXM_HOME" <<'PY'
+import json, os, sys, time
+home = sys.argv[1]
+bc, mc = os.path.join(home, "builtin-catalog.json"), os.path.join(home, "model-catalog.json")
+d = json.load(open(bc)); d["_sentinel"] = "keep-me"; json.dump(d, open(bc, "w"), ensure_ascii=False)
+old = time.time() - 3600; os.utime(mc, (old, old))   # 比 config.json 旧 → 必然重建
+PY
+cxm catalog >/dev/null
+check "身份一致时复用缓存（不重复抓取）" "$(python3 -c "import json;print(json.load(open('$CXM_HOME/builtin-catalog.json')).get('_sentinel','已丢失'))")" "keep-me"
+# 7c) 守护进程同步的决策矩阵（纯函数，不会真的去动守护进程）
+#     顺序：版本一致 / 倒挂且无窗口 / 倒挂且有窗口 / 倒挂且窗口数不明 / 读不到守护进程版本 / 读不到客户端版本
+DM=$(node -e "
+import('$ROOT/dist/codexSync.js').then(m=>{
+  const d=m.decideAppServerSync;
+  console.log([d('1.0.0','1.0.0',0), d('2.0.0','1.0.0',0), d('2.0.0','1.0.0',3), d('2.0.0','1.0.0',null), d('2.0.0',null,0), d(null,'1.0.0',0)].join(','));
+});")
+check "同步决策矩阵（只在无窗口时动手）" "$DM" "skip,sync,warn,warn,skip,skip"
 
 echo
 echo "===== 结果：通过 $PASS 项，失败 $FAIL 项 ====="

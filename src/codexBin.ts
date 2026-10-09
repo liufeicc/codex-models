@@ -209,6 +209,43 @@ export function resolveRealCodex(configured?: string): string | null {
   return null;
 }
 
+/**
+ * 读 Codex 真身的版本号（如 "0.161.0"），读不到返回 null。
+ *
+ * 实现：npm 全局布局下，真身是 `<prefix>/lib/node_modules/@openai/codex/bin/codex.js`，
+ * 它的上一级目录就是包根，里面必有 package.json 的 `version`。
+ * 所以只读文件、不起进程 —— 这条判断会出现在每次开窗的路径上，必须零成本。
+ * 非 npm 布局（自编译二进制、发行版包）读不到，返回 null，由调用方退化处理。
+ */
+export function codexVersion(codexBin: string): string | null {
+  try {
+    const pkg = path.join(path.dirname(codexBin), "..", "package.json");
+    const parsed = JSON.parse(fs.readFileSync(pkg, "utf-8")) as { version?: unknown };
+    return typeof parsed.version === "string" && parsed.version ? parsed.version : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 计算 Codex 真身的「身份串」，用来判断跟着版本走的东西是否过期
+ * （目前是模型目录缓存：升级后元数据 schema 可能新增必填字段）。
+ *
+ * 优先用版本号（换版本一定会变，且不受"同版本重装"干扰）；
+ * 版本读不到时退化为「mtime + 大小」的文件戳 —— 非 npm 布局下二进制被替换
+ * 时这两个值必变，同样能捕捉到升级。两者都拿不到就没法判断。
+ */
+export function codexIdentity(codexBin: string): string {
+  const version = codexVersion(codexBin);
+  if (version) return `v:${version}`;
+  try {
+    const st = fs.statSync(codexBin);
+    return `s:${st.mtimeMs}-${st.size}`;
+  } catch {
+    return "unknown";
+  }
+}
+
 /** 生成壳脚本内容（直接 exec cxm launch，参数原样透传；顺带记下真身，便于日后自愈） */
 function shimScript(realCodex: string): string {
   // 用 node 绝对路径 + dist/cli.js 绝对路径：不依赖 cxm 是否在 PATH 里
